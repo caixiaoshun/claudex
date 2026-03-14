@@ -38,7 +38,8 @@ jobs:
         run: npm ci
 
       - name: Bump version
-        run: npm version ${{ inputs.version }} -m 'chore: bump version to %s'
+        run: |
+          npm version ${{ inputs.version }} -m "chore: bump version to %s"
 
       - name: Build
         run: npm run build
