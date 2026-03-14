@@ -197,7 +197,7 @@ export async function authorize(): Promise<token.SessionData> {
   return new Promise<token.SessionData>((resolve, reject) => {
     const timeout = setTimeout(() => {
       server.close();
-      reject(new Error("OAuth timeout — authorization took too long (5 min)"));
+      reject(new Error("OAuth timeout - authorization took too long (5 min)"));
     }, 5 * 60 * 1000);
 
     const server = http.createServer(async (req, res) => {
@@ -230,7 +230,7 @@ export async function authorize(): Promise<token.SessionData> {
         }
 
         if (returnedState !== state) {
-          const msg = "Invalid state — potential CSRF attack";
+          const msg = "Invalid state - potential CSRF attack";
           res.writeHead(400, { "Content-Type": "text/html" });
           res.end(htmlError(msg));
           clearTimeout(timeout);

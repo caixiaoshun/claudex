@@ -760,7 +760,7 @@ export function buildErrorResponse(
   if (statusCode === 429) errorType = "rate_limit_error";
   if (statusCode === 400) errorType = "invalid_request_error";
   if (statusCode === 404) errorType = "not_found_error";
-  if (statusCode === 529) errorType = "overloaded_error";
+  if (statusCode === 529 || statusCode === 503) errorType = "overloaded_error";
 
   return {
     type: "error",

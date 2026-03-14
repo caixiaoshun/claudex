@@ -105,9 +105,9 @@ async function handleMessages(
         401: 401,
         403: 401,
         429: 429,
-        500: 529,
+        500: 503,
       };
-      const anthropicStatus = statusMap[codexRes.status] || 500;
+      const anthropicStatus = statusMap[codexRes.status] || 502;
 
       res.writeHead(anthropicStatus, { "Content-Type": "application/json" });
       res.end(
