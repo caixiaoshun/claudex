@@ -23,7 +23,7 @@
     "ai",
     "bridge"
   ],
-  "author": "",
+  "author": "caixiaoshun",
   "license": "GPL-3.0",
   "engines": {
     "node": ">=18.0.0"
