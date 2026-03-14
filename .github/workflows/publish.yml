@@ -2,6 +2,16 @@ name: Publish to npm
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version bump type'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 jobs:
   publish:
@@ -27,8 +37,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Bump version (patch)
-        run: npm version patch -m "chore: bump version to %s"
+      - name: Bump version
+        run: npm version ${{ inputs.version }} -m 'chore: bump version to %s'
 
       - name: Build
         run: npm run build
