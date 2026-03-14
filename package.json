@@ -1,0 +1,37 @@
+{
+  "name": "claudex",
+  "version": "1.0.0",
+  "description": "Bridge Claude Code to ChatGPT Codex via local proxy — use your ChatGPT subscription with Claude Code",
+  "main": "dist/src/index.js",
+  "bin": {
+    "claudex": "dist/src/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "test": "node --test dist/tests/*.test.js",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [
+    "claude",
+    "codex",
+    "chatgpt",
+    "proxy",
+    "anthropic",
+    "openai",
+    "ai",
+    "bridge"
+  ],
+  "author": "",
+  "license": "GPL-3.0",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist"
+  ],
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}

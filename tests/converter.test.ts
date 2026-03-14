@@ -1,0 +1,418 @@
+/**
+ * Unit tests for format converter
+ * 格式转换器的单元测试
+ */
+
+import { describe, it } from "node:test";
+import * as assert from "node:assert/strict";
+import {
+  anthropicToCodex,
+  codexToAnthropic,
+  buildErrorResponse,
+  estimateTokens,
+  estimateRequestTokens,
+  StreamConverter,
+  type AnthropicRequest,
+} from "../src/converter.js";
+
+describe("anthropicToCodex", () => {
+  it("should convert a simple text request", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello, world!" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.model, "gpt-5.3-codex");
+    assert.equal(result.max_output_tokens, 1024);
+    assert.equal(result.input.length, 1);
+    assert.equal(result.input[0].role, "user");
+    assert.equal(result.input[0].content, "Hello, world!");
+  });
+
+  it("should convert system prompt to instructions", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      system: "You are a helpful coding assistant.",
+      messages: [{ role: "user", content: "Help me" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.instructions, "You are a helpful coding assistant.");
+  });
+
+  it("should convert array system prompt", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      system: [
+        { type: "text", text: "You are helpful." },
+        { type: "text", text: "Be concise." },
+      ],
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.instructions, "You are helpful.\nBe concise.");
+  });
+
+  it("should convert multi-turn conversation", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "assistant", content: "Hi there!" },
+        { role: "user", content: "How are you?" },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.input.length, 3);
+    assert.equal(result.input[0].content, "Hello");
+    assert.equal(result.input[1].role, "assistant");
+    assert.equal(result.input[1].content, "Hi there!");
+    assert.equal(result.input[2].content, "How are you?");
+  });
+
+  it("should convert tools to OpenAI format", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        {
+          name: "get_weather",
+          description: "Get current weather",
+          input_schema: {
+            type: "object",
+            properties: { location: { type: "string" } },
+            required: ["location"],
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.ok(result.tools);
+    assert.equal(result.tools!.length, 1);
+    assert.equal(result.tools![0].type, "function");
+    assert.equal(result.tools![0].function.name, "get_weather");
+    assert.equal(result.tools![0].function.description, "Get current weather");
+  });
+
+  it("should convert stream flag", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      stream: true,
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.stream, true);
+  });
+
+  it("should convert temperature and top_p", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      temperature: 0.7,
+      top_p: 0.9,
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.temperature, 0.7);
+    assert.equal(result.top_p, 0.9);
+  });
+
+  it("should convert tool_use content blocks", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me check the weather." },
+            {
+              type: "tool_use",
+              id: "toolu_123",
+              name: "get_weather",
+              input: { location: "Tokyo" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_123",
+              content: "Sunny, 25°C",
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    // Assistant message should have text + function call
+    assert.equal(result.input.length, 2);
+    const assistantMsg = result.input[0];
+    assert.equal(assistantMsg.role, "assistant");
+    assert.ok(Array.isArray(assistantMsg.content));
+
+    // User message with tool result
+    const toolResultMsg = result.input[1];
+    assert.equal(toolResultMsg.role, "user");
+  });
+
+  it("should convert stop_sequences to stop", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      stop_sequences: ["END", "STOP"],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.deepEqual(result.stop, ["END", "STOP"]);
+  });
+});
+
+describe("codexToAnthropic", () => {
+  it("should convert a simple Responses API response", () => {
+    const codexRes = {
+      id: "resp_abc123",
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "Hello from Codex!" }],
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
+
+    assert.equal(result.type, "message");
+    assert.equal(result.role, "assistant");
+    assert.equal(result.content.length, 1);
+    assert.equal(result.content[0].type, "text");
+    assert.equal(
+      (result.content[0] as { type: "text"; text: string }).text,
+      "Hello from Codex!"
+    );
+    assert.equal(result.model, "claude-3-5-sonnet-20241022");
+    assert.equal(result.stop_reason, "end_turn");
+    assert.equal(result.usage.input_tokens, 10);
+    assert.equal(result.usage.output_tokens, 5);
+  });
+
+  it("should handle function_call output", () => {
+    const codexRes = {
+      id: "resp_abc123",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          id: "call_123",
+          name: "get_weather",
+          arguments: '{"location":"Tokyo"}',
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 15 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
+
+    assert.equal(result.content.length, 1);
+    assert.equal(result.content[0].type, "tool_use");
+    assert.equal(result.stop_reason, "tool_use");
+  });
+
+  it("should fallback to Chat Completions format", () => {
+    const codexRes = {
+      id: "chatcmpl-abc123",
+      choices: [
+        {
+          message: { role: "assistant", content: "Hello!" },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
+
+    assert.equal(result.content.length, 1);
+    assert.equal(
+      (result.content[0] as { type: "text"; text: string }).text,
+      "Hello!"
+    );
+    assert.equal(result.stop_reason, "end_turn");
+  });
+
+  it("should handle incomplete status as max_tokens", () => {
+    const codexRes = {
+      id: "resp_abc123",
+      status: "incomplete",
+      output: [
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "Partial..." }],
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 100 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
+
+    assert.equal(result.stop_reason, "max_tokens");
+  });
+});
+
+describe("StreamConverter", () => {
+  it("should emit message_start on first event", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent("response.output_text.delta", {
+      delta: "Hello",
+    });
+
+    assert.ok(events.length > 0);
+    // First event should be message_start
+    assert.ok(events[0].includes("message_start"));
+    // Should also have ping
+    assert.ok(events.some((e) => e.includes("ping")));
+    // Should have the text delta
+    assert.ok(events.some((e) => e.includes("text_delta")));
+    assert.ok(events.some((e) => e.includes("Hello")));
+  });
+
+  it("should emit content_block_stop on text done", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.processEvent("response.output_text.done", {
+      text: "Hi",
+    });
+
+    assert.ok(events.some((e) => e.includes("content_block_stop")));
+  });
+
+  it("should emit message_stop on response.completed", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    converter.processEvent("response.output_text.done", { text: "Hi" });
+    const events = converter.processEvent("response.completed", {
+      status: "completed",
+      output: [],
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+
+    assert.ok(events.some((e) => e.includes("message_delta")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+    assert.ok(events.some((e) => e.includes("end_turn")));
+  });
+
+  it("should handle tool_use in streaming", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    // First text
+    converter.processEvent("response.output_text.delta", { delta: "Let me check." });
+    converter.processEvent("response.output_text.done", { text: "Let me check." });
+    // Then function call
+    const events = converter.processEvent("response.output_item.done", {
+      item: {
+        type: "function_call",
+        id: "call_123",
+        name: "get_weather",
+        arguments: '{"location":"Tokyo"}',
+      },
+    });
+
+    assert.ok(events.some((e) => e.includes("tool_use")));
+    assert.ok(events.some((e) => e.includes("get_weather")));
+  });
+
+  it("should finalize properly if no completion event", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.finalize();
+
+    assert.ok(events.some((e) => e.includes("content_block_stop")));
+    assert.ok(events.some((e) => e.includes("message_delta")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+
+  it("should handle Chat Completions streaming format", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent("", {
+      choices: [{ delta: { content: "Hello" }, finish_reason: null }],
+    });
+
+    assert.ok(events.some((e) => e.includes("text_delta")));
+    assert.ok(events.some((e) => e.includes("Hello")));
+  });
+});
+
+describe("buildErrorResponse", () => {
+  it("should build 401 error", () => {
+    const res = buildErrorResponse(401, "Unauthorized");
+    assert.equal(res.type, "error");
+    assert.equal(res.error.type, "authentication_error");
+    assert.equal(res.error.message, "Unauthorized");
+  });
+
+  it("should build 429 error", () => {
+    const res = buildErrorResponse(429, "Rate limited");
+    assert.equal(res.error.type, "rate_limit_error");
+  });
+
+  it("should build 400 error", () => {
+    const res = buildErrorResponse(400, "Bad request");
+    assert.equal(res.error.type, "invalid_request_error");
+  });
+
+  it("should build generic 500 error", () => {
+    const res = buildErrorResponse(500, "Internal error");
+    assert.equal(res.error.type, "api_error");
+  });
+});
+
+describe("estimateTokens", () => {
+  it("should estimate tokens roughly", () => {
+    assert.equal(estimateTokens("Hello, world!"), 4); // 13 chars / 4 ≈ 4
+    assert.equal(estimateTokens(""), 0);
+    assert.equal(estimateTokens("a"), 1);
+  });
+});
+
+describe("estimateRequestTokens", () => {
+  it("should estimate tokens for a request", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      system: "System prompt",
+      messages: [
+        { role: "user", content: "Hello" },
+        { role: "assistant", content: "Hi there" },
+      ],
+    };
+
+    const tokens = estimateRequestTokens(req);
+    assert.ok(tokens > 0);
+  });
+});
