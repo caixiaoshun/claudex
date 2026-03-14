@@ -40,10 +40,11 @@ interface IdTokenClaims {
 function generateRandomString(length: number): string {
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-  const bytes = crypto.randomBytes(length);
-  return Array.from(bytes)
-    .map((b) => chars[b % chars.length])
-    .join("");
+  const result: string[] = [];
+  for (let i = 0; i < length; i++) {
+    result.push(chars[crypto.randomInt(chars.length)]);
+  }
+  return result.join("");
 }
 
 function base64UrlEncode(buffer: Buffer | Uint8Array): string {
