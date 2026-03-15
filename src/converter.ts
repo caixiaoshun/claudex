@@ -223,17 +223,97 @@ function resolveReasoning(
 // ===================================================================
 
 /**
+ * Whitelist of JSON Schema keywords the Codex API accepts inside tool
+ * parameter definitions.  Anything not on this list is silently dropped.
+ *
+ * Using a whitelist (instead of a blacklist) ensures that *any* new or
+ * exotic keyword Claude Code adds will be stripped automatically,
+ * preventing the entire class of "Invalid schema" 400 errors.
+ */
+const ALLOWED_SCHEMA_KEYWORDS = new Set<string>([
+  "type",
+  "description",
+  "properties",
+  "required",
+  "additionalProperties",
+  "items",
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "enum",
+  "const",
+  "default",
+  "nullable",
+  "title",
+]);
+
+/**
+ * Recursively sanitize a JSON Schema node:
+ *  1. Keep only whitelisted keywords (strip `format`, `$schema`, `$id`,
+ *     `$ref`, `examples`, `contentEncoding`, `contentMediaType`, …).
+ *  2. Recurse into `properties`, `items`, `anyOf`, `oneOf`, `allOf`.
+ *  3. At every object-level node that has `properties`, enforce
+ *     `required = Object.keys(properties)` and
+ *     `additionalProperties = false`.
+ */
+export function sanitizeToolSchema(
+  node: unknown,
+): Record<string, unknown> | unknown {
+  if (node === null || node === undefined || typeof node !== "object") {
+    return node;
+  }
+  if (Array.isArray(node)) {
+    return node.map((item) => sanitizeToolSchema(item));
+  }
+
+  const src = node as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  for (const key of Object.keys(src)) {
+    if (!ALLOWED_SCHEMA_KEYWORDS.has(key)) continue; // strip unknown keywords
+    const value = src[key];
+
+    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
+      const props = value as Record<string, unknown>;
+      const sanitized: Record<string, unknown> = {};
+      for (const propName of Object.keys(props)) {
+        sanitized[propName] = sanitizeToolSchema(props[propName]);
+      }
+      out.properties = sanitized;
+    } else if (key === "items" && value && typeof value === "object") {
+      out.items = sanitizeToolSchema(value);
+    } else if ((key === "anyOf" || key === "oneOf" || key === "allOf") && Array.isArray(value)) {
+      out[key] = value.map((v) => sanitizeToolSchema(v));
+    } else {
+      out[key] = value;
+    }
+  }
+
+  // Enforce required = all property keys, additionalProperties = false
+  if (out.properties && typeof out.properties === "object") {
+    const allKeys = Object.keys(out.properties as Record<string, unknown>);
+    out.required = allKeys;
+    out.additionalProperties = false;
+  }
+
+  return out;
+}
+
+/**
  * Convert an Anthropic tool definition to a Codex Responses API tool.
  * The Codex API requires:
  * - flat format: { type: "function", name, description, strict: true, parameters }
  * - `required` must include EVERY key in `properties`
  * - `additionalProperties` must be false
  * - `strict` must be true
+ * - Only whitelisted JSON Schema keywords in parameter schemas
  */
 function convertTool(tool: AnthropicTool): CodexTool {
-  const schema = tool.input_schema || {};
-  const properties = (schema.properties as Record<string, unknown>) || {};
-  // Always enforce: required = all keys from properties
+  const rawSchema = tool.input_schema || {};
+  const sanitized = sanitizeToolSchema(rawSchema) as Record<string, unknown>;
+
+  // Ensure top-level properties exist
+  const properties = (sanitized.properties as Record<string, unknown>) || {};
   const allKeys = Object.keys(properties);
 
   return {

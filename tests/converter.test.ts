@@ -15,6 +15,7 @@ import {
   mapModel,
   proxyConfig,
   CODEX_MODELS,
+  sanitizeToolSchema,
   type AnthropicRequest,
 } from "../src/converter.js";
 import { _resetForTesting, getModels } from "../src/models.js";
@@ -349,6 +350,317 @@ describe("anthropicToCodex", () => {
         `Unexpected key "${key}" in Codex request`
       );
     }
+  });
+});
+
+describe("sanitizeToolSchema", () => {
+  it("should strip format from property definitions", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        url: { type: "string", format: "uri" },
+        name: { type: "string" },
+      },
+      required: ["url"],
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.equal(props.url.type, "string");
+    assert.equal(props.url.format, undefined);
+    assert.equal(props.name.type, "string");
+  });
+
+  it("should strip format from deeply nested schemas", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        config: {
+          type: "object",
+          properties: {
+            endpoint: { type: "string", format: "uri" },
+            timeout: { type: "integer", format: "int32" },
+          },
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const config = (result.properties as Record<string, Record<string, unknown>>).config;
+    const nested = config.properties as Record<string, Record<string, unknown>>;
+    assert.equal(nested.endpoint.format, undefined);
+    assert.equal(nested.endpoint.type, "string");
+    assert.equal(nested.timeout.format, undefined);
+  });
+
+  it("should strip format inside items (array schemas)", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        urls: {
+          type: "array",
+          items: { type: "string", format: "uri" },
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const urls = (result.properties as Record<string, Record<string, unknown>>).urls;
+    const items = urls.items as Record<string, unknown>;
+    assert.equal(items.type, "string");
+    assert.equal(items.format, undefined);
+  });
+
+  it("should strip format inside anyOf/oneOf/allOf", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        value: {
+          anyOf: [
+            { type: "string", format: "date-time" },
+            { type: "number", format: "double" },
+          ],
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const value = (result.properties as Record<string, Record<string, unknown>>).value;
+    const anyOf = value.anyOf as Array<Record<string, unknown>>;
+    assert.equal(anyOf[0].format, undefined);
+    assert.equal(anyOf[0].type, "string");
+    assert.equal(anyOf[1].format, undefined);
+    assert.equal(anyOf[1].type, "number");
+  });
+
+  it("should strip $schema, $id, $ref, examples, and other unsupported keywords", () => {
+    const schema = {
+      $schema: "http://json-schema.org/draft-07/schema#",
+      $id: "test",
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          examples: ["Alice", "Bob"],
+          contentEncoding: "utf-8",
+          contentMediaType: "text/plain",
+          minLength: 1,
+          maxLength: 100,
+          pattern: "^[a-zA-Z]+$",
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    assert.equal(result.$schema, undefined);
+    assert.equal(result.$id, undefined);
+    const name = (result.properties as Record<string, Record<string, unknown>>).name;
+    assert.equal(name.type, "string");
+    assert.equal(name.examples, undefined);
+    assert.equal(name.contentEncoding, undefined);
+    assert.equal(name.contentMediaType, undefined);
+    assert.equal(name.minLength, undefined);
+    assert.equal(name.maxLength, undefined);
+    assert.equal(name.pattern, undefined);
+  });
+
+  it("should enforce required = all property keys at every level", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        outer: {
+          type: "object",
+          properties: {
+            inner_a: { type: "string" },
+            inner_b: { type: "number" },
+          },
+          required: ["inner_a"], // only partial
+        },
+      },
+      required: [], // empty
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    // top level: required should include "outer"
+    assert.deepEqual(result.required, ["outer"]);
+    // nested level: required should include both inner keys
+    const outer = (result.properties as Record<string, Record<string, unknown>>).outer;
+    const innerRequired = outer.required as string[];
+    assert.ok(innerRequired.includes("inner_a"));
+    assert.ok(innerRequired.includes("inner_b"));
+    assert.equal(innerRequired.length, 2);
+  });
+
+  it("should enforce additionalProperties = false at every object level", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        nested: {
+          type: "object",
+          properties: {
+            x: { type: "string" },
+          },
+          additionalProperties: true,
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    assert.equal(result.additionalProperties, false);
+    const nested = (result.properties as Record<string, Record<string, unknown>>).nested;
+    assert.equal(nested.additionalProperties, false);
+  });
+
+  it("should handle primitives and null gracefully", () => {
+    assert.equal(sanitizeToolSchema(null), null);
+    assert.equal(sanitizeToolSchema(undefined), undefined);
+    assert.equal(sanitizeToolSchema("string"), "string");
+    assert.equal(sanitizeToolSchema(42), 42);
+    assert.equal(sanitizeToolSchema(true), true);
+  });
+
+  it("should preserve enum and const values", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["read", "write"] },
+        version: { const: 2 },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(props.mode.enum, ["read", "write"]);
+    assert.equal(props.version.const, 2);
+  });
+
+  it("should sanitize nested properties inside anyOf branches", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        value: {
+          anyOf: [
+            {
+              type: "object",
+              properties: {
+                name: { type: "string", format: "hostname" },
+                port: { type: "integer", minimum: 0, maximum: 65535 },
+              },
+              required: ["name"],
+            },
+            { type: "string", format: "uri" },
+          ],
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const value = (result.properties as Record<string, Record<string, unknown>>).value;
+    const anyOf = value.anyOf as Array<Record<string, unknown>>;
+    // First branch: object with properties
+    const branch0Props = anyOf[0].properties as Record<string, Record<string, unknown>>;
+    assert.equal(branch0Props.name.format, undefined);
+    assert.equal(branch0Props.name.type, "string");
+    assert.equal((branch0Props.port as Record<string, unknown>).minimum, undefined);
+    assert.equal((branch0Props.port as Record<string, unknown>).maximum, undefined);
+    // required should include all keys in the branch
+    assert.deepEqual(anyOf[0].required, ["name", "port"]);
+    assert.equal(anyOf[0].additionalProperties, false);
+    // Second branch: format stripped
+    assert.equal(anyOf[1].format, undefined);
+    assert.equal(anyOf[1].type, "string");
+  });
+
+  it("should preserve primitive values inside enum arrays and const", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["active", "inactive", null] },
+        count: { type: "integer", const: 42, format: "int32" },
+        flag: { type: "boolean", default: true },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(props.status.enum, ["active", "inactive", null]);
+    assert.equal(props.count.const, 42);
+    assert.equal(props.count.format, undefined); // format still stripped
+    assert.equal(props.flag.default, true);
+  });
+});
+
+describe("anthropicToCodex tool schema sanitization (integration)", () => {
+  it("should strip format:uri from WebFetch-like tool", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "fetch" }],
+      tools: [
+        {
+          name: "WebFetch",
+          description: "Fetch a URL",
+          input_schema: {
+            type: "object",
+            properties: {
+              url: { type: "string", format: "uri" },
+              raw: { type: "boolean" },
+            },
+            required: ["url"],
+          },
+        },
+      ],
+    };
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters;
+    const url = (params.properties as Record<string, Record<string, unknown>>).url;
+    assert.equal(url.type, "string");
+    assert.equal(url.format, undefined);
+    // required includes all keys
+    assert.ok(params.required.includes("url"));
+    assert.ok(params.required.includes("raw"));
+  });
+
+  it("should strip all unsupported keywords from complex tool schemas", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "test" }],
+      tools: [
+        {
+          name: "ComplexTool",
+          description: "Complex",
+          input_schema: {
+            type: "object",
+            $schema: "http://json-schema.org/draft-07/schema#",
+            properties: {
+              endpoint: { type: "string", format: "uri", minLength: 1 },
+              items: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "integer", format: "int64" },
+                    tags: {
+                      type: "array",
+                      items: { type: "string", pattern: "^[a-z]+$" },
+                    },
+                  },
+                },
+              },
+            },
+            required: ["endpoint"],
+          },
+        },
+      ],
+    };
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters;
+    // $schema stripped at top
+    assert.equal((params as unknown as Record<string, unknown>).$schema, undefined);
+    // format stripped from endpoint
+    const endpoint = (params.properties as Record<string, Record<string, unknown>>).endpoint;
+    assert.equal(endpoint.format, undefined);
+    assert.equal((endpoint as Record<string, unknown>).minLength, undefined);
+    // format stripped from nested items
+    const itemsArr = (params.properties as Record<string, Record<string, unknown>>).items;
+    const itemSchema = itemsArr.items as Record<string, unknown>;
+    const idProp = ((itemSchema as Record<string, Record<string, unknown>>).properties as Record<string, Record<string, unknown>>).id;
+    assert.equal(idProp.format, undefined);
+    // pattern stripped from deeply nested tags items
+    const tagsProp = ((itemSchema as Record<string, Record<string, unknown>>).properties as Record<string, Record<string, unknown>>).tags;
+    const tagsItems = tagsProp.items as Record<string, unknown>;
+    assert.equal(tagsItems.pattern, undefined);
   });
 });
 
