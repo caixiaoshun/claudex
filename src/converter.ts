@@ -66,6 +66,10 @@ export interface AnthropicRequest {
   tools?: AnthropicTool[];
   stop_sequences?: string[];
   metadata?: Record<string, unknown>;
+  // Anthropic-specific fields that Claude Code may send (must be stripped)
+  betas?: string[];
+  thinking?: Record<string, unknown>;
+  stream_options?: Record<string, unknown>;
 }
 
 export interface AnthropicResponse {
@@ -118,17 +122,22 @@ interface OpenAITool {
   };
 }
 
+export interface CodexReasoning {
+  effort?: "low" | "medium" | "high";
+  summary?: "auto" | "concise" | "detailed";
+}
+
 interface OpenAIResponsesRequest {
   model: string;
   instructions?: string;
   input: OpenAIInputMessage[];
   store: boolean;
   stream?: boolean;
-  temperature?: number;
-  top_p?: number;
-  max_output_tokens?: number;
   tools?: OpenAITool[];
-  stop?: string[];
+  tool_choice?: string;
+  parallel_tool_calls?: boolean;
+  reasoning?: CodexReasoning;
+  include?: string[];
 }
 
 // ---------- Model Mapping ----------
@@ -136,13 +145,151 @@ interface OpenAIResponsesRequest {
 const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
 
 /**
+ * Available Codex models — sourced from the openai/codex and opencode repositories.
+ */
+export const CODEX_MODELS: Record<
+  string,
+  { name: string; description: string; tier: "high" | "mid" | "fast" }
+> = {
+  "gpt-5.3-codex": {
+    name: "GPT-5.3 Codex",
+    description: "Default balanced model for coding tasks",
+    tier: "mid",
+  },
+  "gpt-5.2-codex": {
+    name: "GPT-5.2 Codex",
+    description: "Previous generation Codex model",
+    tier: "mid",
+  },
+  "gpt-5.1-codex": {
+    name: "GPT-5.1 Codex",
+    description: "GPT-5.1 based Codex model",
+    tier: "mid",
+  },
+  "gpt-5.1-codex-max": {
+    name: "GPT-5.1 Codex Max",
+    description: "Highest capability Codex model with maximum reasoning",
+    tier: "high",
+  },
+  "gpt-5.1-codex-mini": {
+    name: "GPT-5.1 Codex Mini",
+    description: "Lightweight fast Codex model",
+    tier: "fast",
+  },
+  "gpt-5.2": {
+    name: "GPT-5.2",
+    description: "General GPT-5.2 model",
+    tier: "mid",
+  },
+  "gpt-5.4": {
+    name: "GPT-5.4",
+    description: "Latest GPT-5.4 model",
+    tier: "high",
+  },
+};
+
+/**
+ * Map from Anthropic model family patterns to Codex models.
+ */
+const ANTHROPIC_TO_CODEX_MAP: Array<{ pattern: RegExp; codexModel: string }> = [
+  { pattern: /opus/i, codexModel: "gpt-5.1-codex-max" },
+  { pattern: /sonnet/i, codexModel: "gpt-5.3-codex" },
+  { pattern: /haiku/i, codexModel: "gpt-5.1-codex-mini" },
+];
+
+/**
+ * Runtime proxy configuration — can be updated via POST /claudex/config.
+ */
+export const proxyConfig = {
+  model: process.env.CODEX_MODEL || "",
+  reasoning: (process.env.CODEX_REASONING || "") as "" | "low" | "medium" | "high",
+};
+
+/**
+ * Parse a `claudex:model:reasoning` model string convention.
+ * Returns null if the string doesn't match the convention.
+ *
+ * Examples:
+ *   "claudex:gpt-5.3-codex:high" → { model: "gpt-5.3-codex", reasoning: "high" }
+ *   "claudex:gpt-5.1-codex-max"  → { model: "gpt-5.1-codex-max", reasoning: undefined }
+ */
+export function parseClaudexModelString(
+  model: string
+): { model: string; reasoning?: "low" | "medium" | "high" } | null {
+  if (!model.startsWith("claudex:")) return null;
+  const parts = model.slice("claudex:".length).split(":");
+  if (parts.length === 0 || !parts[0]) return null;
+  const result: { model: string; reasoning?: "low" | "medium" | "high" } = {
+    model: parts[0],
+  };
+  if (parts.length >= 2 && ["low", "medium", "high"].includes(parts[1])) {
+    result.reasoning = parts[1] as "low" | "medium" | "high";
+  }
+  return result;
+}
+
+/**
  * Map an Anthropic model name to a Codex model name.
- * Anthropic 模型名称映射到 Codex 模型名称。
+ * Priority: claudex: convention > runtime config > env var > pattern match > default.
  */
 export function mapModel(anthropicModel: string): string {
+  // 1. Check for claudex: convention
+  const parsed = parseClaudexModelString(anthropicModel);
+  if (parsed) return parsed.model;
+
+  // 2. Check runtime config
+  if (proxyConfig.model) return proxyConfig.model;
+
+  // 3. Check env var
   const envModel = process.env.CODEX_MODEL;
   if (envModel) return envModel;
+
+  // 4. Pattern match against Anthropic model families
+  for (const { pattern, codexModel } of ANTHROPIC_TO_CODEX_MAP) {
+    if (pattern.test(anthropicModel)) return codexModel;
+  }
+
+  // 5. Default
   return DEFAULT_CODEX_MODEL;
+}
+
+/**
+ * Determine reasoning effort for a request.
+ * Priority: claudex: convention > Anthropic thinking config > runtime config > env var.
+ */
+function resolveReasoning(
+  req: AnthropicRequest
+): CodexReasoning | undefined {
+  // 1. Check claudex: convention
+  const parsed = parseClaudexModelString(req.model);
+  if (parsed?.reasoning) {
+    return { effort: parsed.reasoning };
+  }
+
+  // 2. Map Anthropic extended thinking to reasoning effort
+  if (req.thinking) {
+    const budget = req.thinking.budget_tokens as number | undefined;
+    if (budget !== undefined) {
+      if (budget >= 10000) return { effort: "high" };
+      if (budget >= 5000) return { effort: "medium" };
+      return { effort: "low" };
+    }
+    // thinking is enabled but no budget — default to medium
+    return { effort: "medium" };
+  }
+
+  // 3. Check runtime config
+  if (proxyConfig.reasoning) {
+    return { effort: proxyConfig.reasoning };
+  }
+
+  // 4. Check env var
+  const envReasoning = process.env.CODEX_REASONING;
+  if (envReasoning && ["low", "medium", "high"].includes(envReasoning)) {
+    return { effort: envReasoning as "low" | "medium" | "high" };
+  }
+
+  return undefined;
 }
 
 // ---------- Request Conversion ----------
@@ -150,6 +297,12 @@ export function mapModel(anthropicModel: string): string {
 /**
  * Convert an Anthropic Messages API request to an OpenAI Responses API request.
  * 将 Anthropic Messages API 请求转换为 OpenAI Responses API 请求。
+ *
+ * Fields removed (not supported by Codex Responses API):
+ *   max_output_tokens, temperature, top_p, stop, metadata, betas, thinking, stream_options
+ *
+ * Fields added (required or supported by Codex):
+ *   tool_choice, parallel_tool_calls, reasoning, include
  */
 export function anthropicToCodex(req: AnthropicRequest): OpenAIResponsesRequest {
   const model = mapModel(req.model);
@@ -186,11 +339,15 @@ export function anthropicToCodex(req: AnthropicRequest): OpenAIResponsesRequest 
   };
 
   if (instructions) result.instructions = instructions;
-  if (req.max_tokens) result.max_output_tokens = req.max_tokens;
-  if (req.temperature !== undefined) result.temperature = req.temperature;
-  if (req.top_p !== undefined) result.top_p = req.top_p;
-  if (tools) result.tools = tools;
-  if (req.stop_sequences) result.stop = req.stop_sequences;
+  if (tools) {
+    result.tools = tools;
+    result.tool_choice = "auto";
+    result.parallel_tool_calls = true;
+  }
+
+  // Resolve reasoning effort
+  const reasoning = resolveReasoning(req);
+  if (reasoning) result.reasoning = reasoning;
 
   return result;
 }
@@ -546,17 +703,19 @@ export class StreamConverter {
           this.currentBlockOpen = false;
         }
 
-        const usage = data.usage as Record<string, unknown> | undefined;
+        const response = data.response as Record<string, unknown> | undefined;
+        const usageSource = response || data;
+        const usage = usageSource.usage as Record<string, unknown> | undefined;
         if (usage) {
           this.inputTokens = Number(usage.input_tokens || 0);
           this.outputTokens = Number(usage.output_tokens || this.outputTokens);
         }
 
         let stopReason: string = "end_turn";
-        const status = data.status as string | undefined;
+        const status = (response?.status ?? data.status) as string | undefined;
         if (status === "incomplete") stopReason = "max_tokens";
 
-        const output = data.output as Array<Record<string, unknown>> | undefined;
+        const output = (response?.output ?? data.output) as Array<Record<string, unknown>> | undefined;
         if (output?.some((o) => o.type === "function_call")) {
           stopReason = "tool_use";
         }
@@ -565,6 +724,80 @@ export class StreamConverter {
           this.formatSSE("message_delta", {
             type: "message_delta",
             delta: { stop_reason: stopReason, stop_sequence: null },
+            usage: { output_tokens: this.outputTokens },
+          })
+        );
+        events.push(
+          this.formatSSE("message_stop", { type: "message_stop" })
+        );
+        this.completed = true;
+        break;
+      }
+
+      // Events the Codex API emits that we can safely acknowledge but don't need to forward
+      case "response.created":
+      case "response.output_item.added":
+      case "response.reasoning_summary_part.added":
+        break;
+
+      // Reasoning events — pass through as text for clients that support it
+      case "response.reasoning_summary_text.delta":
+      case "response.reasoning_text.delta": {
+        // Reasoning deltas are internal; we don't surface them to Anthropic clients
+        break;
+      }
+
+      // Error/failure events from the Codex stream
+      case "response.failed": {
+        const resp = data.response as Record<string, unknown> | undefined;
+        const error = resp?.error as Record<string, unknown> | undefined;
+        const errorMsg = String(error?.message || "Codex response failed");
+
+        if (this.currentBlockOpen) {
+          events.push(
+            this.formatSSE("content_block_stop", {
+              type: "content_block_stop",
+              index: this.contentIndex,
+            })
+          );
+          this.currentBlockOpen = false;
+        }
+
+        events.push(
+          this.formatSSE("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: this.outputTokens },
+          })
+        );
+        events.push(
+          this.formatSSE("error", {
+            type: "error",
+            error: { type: "api_error", message: errorMsg },
+          })
+        );
+        events.push(
+          this.formatSSE("message_stop", { type: "message_stop" })
+        );
+        this.completed = true;
+        break;
+      }
+
+      case "response.incomplete": {
+        if (this.currentBlockOpen) {
+          events.push(
+            this.formatSSE("content_block_stop", {
+              type: "content_block_stop",
+              index: this.contentIndex,
+            })
+          );
+          this.currentBlockOpen = false;
+        }
+
+        events.push(
+          this.formatSSE("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "max_tokens", stop_sequence: null },
             usage: { output_tokens: this.outputTokens },
           })
         );

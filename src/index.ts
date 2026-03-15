@@ -13,6 +13,7 @@ import { LogLevel } from "./logger.js";
 import * as oauth from "./oauth.js";
 import * as token from "./token.js";
 import { startServer } from "./server.js";
+import { proxyConfig, CODEX_MODELS } from "./converter.js";
 
 const DEFAULT_PORT = 4000;
 
@@ -43,6 +44,17 @@ async function main(): Promise<void> {
         console.error("Invalid port number");
         process.exit(1);
       }
+      i++;
+    } else if (args[i] === "--model" && args[i + 1]) {
+      proxyConfig.model = args[i + 1];
+      i++;
+    } else if (args[i] === "--reasoning" && args[i + 1]) {
+      const val = args[i + 1];
+      if (!["low", "medium", "high"].includes(val)) {
+        console.error("Invalid reasoning level. Must be low, medium, or high.");
+        process.exit(1);
+      }
+      proxyConfig.reasoning = val as "low" | "medium" | "high";
       i++;
     } else if (args[i] === "--debug") {
       logger.setLogLevel(LogLevel.DEBUG);
@@ -92,8 +104,14 @@ async function main(): Promise<void> {
   // Step 2: Start proxy server
   const server = startServer(port);
 
+  const modelDisplay = proxyConfig.model || "(auto-mapped from Claude Code model)";
+  const reasoningDisplay = proxyConfig.reasoning || "(auto)";
+
   console.log(`
 \x1b[32m✅ Proxy is ready!\x1b[0m
+
+\x1b[33mModel:\x1b[0m      ${modelDisplay}
+\x1b[33mReasoning:\x1b[0m  ${reasoningDisplay}
 
 \x1b[33mConfigure Claude Code:\x1b[0m
   export ANTHROPIC_BASE_URL=http://localhost:${port}
@@ -192,22 +210,40 @@ Usage:
   claudex [options]
 
 Options:
-  -p, --port <port>   Port to listen on (default: 4000)
-  --reuse-codex       Import credentials from an existing Codex / opencode
-                      installation instead of launching the browser OAuth flow.
-                      Searches:
-                        ~/.codex/auth.json           (OpenAI Codex CLI)
-                        ~/.opencode/session.json     (opencode)
-                        ~/.opencode/auth/codex.json  (opencode v2)
-  --list-sources      List all detected external credential sources and exit.
-  --debug             Enable debug logging
-  -h, --help          Show this help message
-  -v, --version       Show version
+  -p, --port <port>           Port to listen on (default: 4000)
+  --model <model>             Codex model to use (e.g. gpt-5.3-codex)
+  --reasoning <low|medium|high>  Reasoning intensity level
+  --reuse-codex               Import credentials from an existing Codex / opencode
+                              installation instead of launching the browser OAuth flow.
+                              Searches:
+                                ~/.codex/auth.json           (OpenAI Codex CLI)
+                                ~/.opencode/session.json     (opencode)
+                                ~/.opencode/auth/codex.json  (opencode v2)
+  --list-sources              List all detected external credential sources and exit.
+  --debug                     Enable debug logging
+  -h, --help                  Show this help message
+  -v, --version               Show version
 
 Environment Variables:
-  CODEX_MODEL          Codex model to use (default: gpt-5.3-codex)
+  CODEX_MODEL          Codex model to use (default: auto-mapped from Claude Code model)
+  CODEX_REASONING      Reasoning intensity: low, medium, or high
   CODEX_API_ENDPOINT   Override Codex API endpoint
   PROXY_PORT           Default port (overridden by --port)
+
+Model Selection:
+  At startup:        claudex --model gpt-5.3-codex --reasoning high
+  Via env:           CODEX_MODEL=gpt-5.3-codex CODEX_REASONING=high claudex
+  At runtime:        curl -X POST http://localhost:4000/claudex/config \\
+                       -d '{"model":"gpt-5.3-codex","reasoning":"high"}'
+  Via /model in Claude Code:
+                     Use the model name claudex:<codex-model>:<reasoning>
+                     e.g. claudex:gpt-5.3-codex:high
+
+Endpoints:
+  POST /v1/messages      Anthropic Messages API proxy
+  GET  /claudex/models   List available Codex models
+  POST /claudex/config   Update runtime model/reasoning
+  GET  /health           Health check
 
 Examples:
   # First run — open browser for ChatGPT login
@@ -215,6 +251,9 @@ Examples:
 
   # Reuse credentials from an already-logged-in Codex CLI install
   claudex --reuse-codex
+
+  # Use specific model and reasoning level
+  claudex --model gpt-5.1-codex-max --reasoning high
 
   # See what credential files were detected on this machine
   claudex --list-sources
