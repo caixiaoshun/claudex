@@ -13,9 +13,16 @@ import { LogLevel } from "./logger.js";
 import * as oauth from "./oauth.js";
 import * as token from "./token.js";
 import { startServer } from "./server.js";
-import { proxyConfig, CODEX_MODELS } from "./converter.js";
+import { proxyConfig } from "./converter.js";
+import {
+  initModels,
+  refreshModels,
+  startPeriodicRefresh,
+  getModels,
+} from "./models.js";
 
 const DEFAULT_PORT = 4000;
+const DEFAULT_REFRESH_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
 function printBanner(): void {
   console.log(`
@@ -36,6 +43,7 @@ async function main(): Promise<void> {
   let port = DEFAULT_PORT;
   let reuseCodex = false;
   let listSources = false;
+  let refreshModelsFlag = false;
 
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === "--port" || args[i] === "-p") && args[i + 1]) {
@@ -62,6 +70,8 @@ async function main(): Promise<void> {
       reuseCodex = true;
     } else if (args[i] === "--list-sources") {
       listSources = true;
+    } else if (args[i] === "--refresh-models") {
+      refreshModelsFlag = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printHelp();
       process.exit(0);
@@ -101,7 +111,49 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Step 2: Start proxy server
+  // Step 2: Initialize dynamic model list
+  logger.info("Fetching available Codex models...");
+  try {
+    const session = await oauth.getValidSession();
+    await initModels(session.access_token, session.account_id);
+  } catch {
+    // initModels falls back to defaults internally; just log here
+    await initModels();
+  }
+
+  // Handle --refresh-models: refresh and exit
+  if (refreshModelsFlag) {
+    try {
+      const session = await oauth.getValidSession();
+      await refreshModels(session.access_token, session.account_id);
+    } catch (err) {
+      logger.error(
+        `Model refresh failed: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    const models = getModels();
+    console.log("\nAvailable Codex models:");
+    for (const [slug, info] of Object.entries(models)) {
+      console.log(`  ${slug} — ${info.name} [${info.tier}]`);
+    }
+    process.exit(0);
+  }
+
+  // Step 3: Start periodic model refresh
+  const refreshIntervalMs = parseInt(
+    process.env.CODEX_MODEL_REFRESH_INTERVAL || "",
+    10
+  ) || DEFAULT_REFRESH_INTERVAL_MS;
+  startPeriodicRefresh(refreshIntervalMs, async () => {
+    try {
+      const s = await oauth.getValidSession();
+      return { access_token: s.access_token, account_id: s.account_id };
+    } catch {
+      return null;
+    }
+  });
+
+  // Step 4: Start proxy server
   const server = startServer(port);
 
   const modelDisplay = proxyConfig.model || "(auto-mapped from Claude Code model)";
@@ -220,15 +272,17 @@ Options:
                                 ~/.opencode/session.json     (opencode)
                                 ~/.opencode/auth/codex.json  (opencode v2)
   --list-sources              List all detected external credential sources and exit.
+  --refresh-models            Refresh the model list from the Codex API and exit.
   --debug                     Enable debug logging
   -h, --help                  Show this help message
   -v, --version               Show version
 
 Environment Variables:
-  CODEX_MODEL          Codex model to use (default: auto-mapped from Claude Code model)
-  CODEX_REASONING      Reasoning intensity: low, medium, or high
-  CODEX_API_ENDPOINT   Override Codex API endpoint
-  PROXY_PORT           Default port (overridden by --port)
+  CODEX_MODEL                  Codex model to use (default: auto-mapped from Claude Code model)
+  CODEX_REASONING              Reasoning intensity: low, medium, or high
+  CODEX_API_ENDPOINT           Override Codex API endpoint
+  CODEX_MODEL_REFRESH_INTERVAL Model refresh interval in ms (default: 3600000 = 1 hour)
+  PROXY_PORT                   Default port (overridden by --port)
 
 Model Selection:
   At startup:        claudex --model gpt-5.3-codex --reasoning high
@@ -239,11 +293,22 @@ Model Selection:
                      Use the model name claudex:<codex-model>:<reasoning>
                      e.g. claudex:gpt-5.3-codex:high
 
+Model Discovery:
+  On startup, Claudex fetches the live model list from the Codex API
+  and automatically maps Anthropic model tiers (opus/sonnet/haiku) to
+  the best available Codex models. If the endpoint is unreachable, it
+  falls back to a hardcoded default list.
+
+  View live models:  curl http://localhost:4000/claudex/models
+  Refresh models:    curl -X POST http://localhost:4000/claudex/models/refresh
+  CLI refresh:       claudex --refresh-models
+
 Endpoints:
-  POST /v1/messages      Anthropic Messages API proxy
-  GET  /claudex/models   List available Codex models
-  POST /claudex/config   Update runtime model/reasoning
-  GET  /health           Health check
+  POST /v1/messages           Anthropic Messages API proxy
+  GET  /claudex/models        List available Codex models and tier mapping
+  POST /claudex/models/refresh  Re-fetch the model list from Codex API
+  POST /claudex/config        Update runtime model/reasoning
+  GET  /health                Health check
 
 Examples:
   # First run — open browser for ChatGPT login
@@ -257,6 +322,9 @@ Examples:
 
   # See what credential files were detected on this machine
   claudex --list-sources
+
+  # Refresh the model list and show available models
+  claudex --refresh-models
 `);
 }
 
