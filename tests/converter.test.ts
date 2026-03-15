@@ -12,6 +12,10 @@ import {
   estimateTokens,
   estimateRequestTokens,
   StreamConverter,
+  parseClaudexModelString,
+  mapModel,
+  proxyConfig,
+  CODEX_MODELS,
   type AnthropicRequest,
 } from "../src/converter.js";
 
@@ -26,7 +30,8 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     assert.equal(result.model, "gpt-5.3-codex");
-    assert.equal(result.max_output_tokens, 1024);
+    // max_output_tokens must NOT be sent (causes 400 from Codex API)
+    assert.equal((result as unknown as Record<string, unknown>).max_output_tokens, undefined);
     assert.equal(result.input.length, 1);
     assert.equal(result.input[0].role, "user");
     assert.equal(result.input[0].content, "Hello, world!");
@@ -133,19 +138,22 @@ describe("anthropicToCodex", () => {
     assert.equal(result.store, false);
   });
 
-  it("should convert temperature and top_p", () => {
+  it("should strip temperature, top_p, and stop_sequences (not supported by Codex)", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
       messages: [{ role: "user", content: "Hello" }],
       temperature: 0.7,
       top_p: 0.9,
+      stop_sequences: ["END", "STOP"],
     };
 
     const result = anthropicToCodex(req);
 
-    assert.equal(result.temperature, 0.7);
-    assert.equal(result.top_p, 0.9);
+    // These fields must not be forwarded to Codex
+    assert.equal((result as unknown as Record<string, unknown>).temperature, undefined);
+    assert.equal((result as unknown as Record<string, unknown>).top_p, undefined);
+    assert.equal((result as unknown as Record<string, unknown>).stop, undefined);
   });
 
   it("should convert tool_use content blocks", () => {
@@ -191,17 +199,57 @@ describe("anthropicToCodex", () => {
     assert.equal(toolResultMsg.role, "user");
   });
 
-  it("should convert stop_sequences to stop", () => {
+  it("should set tool_choice and parallel_tool_calls when tools present", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
       messages: [{ role: "user", content: "Hello" }],
-      stop_sequences: ["END", "STOP"],
+      tools: [
+        {
+          name: "get_weather",
+          description: "Get current weather",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
     };
 
     const result = anthropicToCodex(req);
 
-    assert.deepEqual(result.stop, ["END", "STOP"]);
+    assert.equal(result.tool_choice, "auto");
+    assert.equal(result.parallel_tool_calls, true);
+  });
+
+  it("should strip Anthropic-specific fields (betas, metadata, thinking, stream_options)", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      betas: ["prompt-caching-2024-07-31"],
+      metadata: { user_id: "test" },
+      thinking: { type: "enabled", budget_tokens: 5000 },
+      stream_options: { include_usage: true },
+    };
+
+    const result = anthropicToCodex(req) as unknown as Record<string, unknown>;
+
+    assert.equal(result.betas, undefined);
+    assert.equal(result.metadata, undefined);
+    assert.equal(result.thinking, undefined);
+    assert.equal(result.stream_options, undefined);
+  });
+
+  it("should map thinking budget to reasoning effort", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      thinking: { type: "enabled", budget_tokens: 15000 },
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.ok(result.reasoning);
+    assert.equal(result.reasoning!.effort, "high");
   });
 });
 
@@ -441,5 +489,116 @@ describe("estimateRequestTokens", () => {
 
     const tokens = estimateRequestTokens(req);
     assert.ok(tokens > 0);
+  });
+});
+
+describe("parseClaudexModelString", () => {
+  it("should parse model with reasoning", () => {
+    const result = parseClaudexModelString("claudex:gpt-5.3-codex:high");
+    assert.ok(result);
+    assert.equal(result!.model, "gpt-5.3-codex");
+    assert.equal(result!.reasoning, "high");
+  });
+
+  it("should parse model without reasoning", () => {
+    const result = parseClaudexModelString("claudex:gpt-5.1-codex-max");
+    assert.ok(result);
+    assert.equal(result!.model, "gpt-5.1-codex-max");
+    assert.equal(result!.reasoning, undefined);
+  });
+
+  it("should return null for non-claudex model names", () => {
+    assert.equal(parseClaudexModelString("claude-3-5-sonnet-20241022"), null);
+    assert.equal(parseClaudexModelString("gpt-5.3-codex"), null);
+  });
+});
+
+describe("mapModel", () => {
+  it("should map opus to highest-tier model", () => {
+    // Clear runtime config for this test
+    const saved = proxyConfig.model;
+    proxyConfig.model = "";
+    const origEnv = process.env.CODEX_MODEL;
+    delete process.env.CODEX_MODEL;
+    try {
+      assert.equal(mapModel("claude-opus-4-20250514"), "gpt-5.1-codex-max");
+    } finally {
+      proxyConfig.model = saved;
+      if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
+    }
+  });
+
+  it("should map sonnet to mid-tier model", () => {
+    const saved = proxyConfig.model;
+    proxyConfig.model = "";
+    const origEnv = process.env.CODEX_MODEL;
+    delete process.env.CODEX_MODEL;
+    try {
+      assert.equal(mapModel("claude-3-5-sonnet-20241022"), "gpt-5.3-codex");
+    } finally {
+      proxyConfig.model = saved;
+      if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
+    }
+  });
+
+  it("should map haiku to fast-tier model", () => {
+    const saved = proxyConfig.model;
+    proxyConfig.model = "";
+    const origEnv = process.env.CODEX_MODEL;
+    delete process.env.CODEX_MODEL;
+    try {
+      assert.equal(mapModel("claude-3-5-haiku-20241022"), "gpt-5.1-codex-mini");
+    } finally {
+      proxyConfig.model = saved;
+      if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
+    }
+  });
+
+  it("should use claudex: convention when present", () => {
+    assert.equal(mapModel("claudex:gpt-5.4:medium"), "gpt-5.4");
+  });
+});
+
+describe("StreamConverter additional events", () => {
+  it("should handle response.created silently", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent("response.created", {
+      response: { id: "resp_123" },
+    });
+
+    // Should emit message_start and ping (triggered by first event), nothing else
+    assert.ok(events.some((e) => e.includes("message_start")));
+  });
+
+  it("should handle response.failed as error", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.processEvent("response.failed", {
+      response: { error: { message: "Something went wrong" } },
+    });
+
+    assert.ok(events.some((e) => e.includes("error")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+
+  it("should handle response.incomplete as max_tokens stop", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.processEvent("response.incomplete", {
+      response: { incomplete_details: { reason: "max_tokens" } },
+    });
+
+    assert.ok(events.some((e) => e.includes("max_tokens")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+});
+
+describe("CODEX_MODELS", () => {
+  it("should contain expected models", () => {
+    assert.ok(CODEX_MODELS["gpt-5.3-codex"]);
+    assert.ok(CODEX_MODELS["gpt-5.1-codex-max"]);
+    assert.ok(CODEX_MODELS["gpt-5.1-codex-mini"]);
+    assert.equal(CODEX_MODELS["gpt-5.1-codex-max"].tier, "high");
+    assert.equal(CODEX_MODELS["gpt-5.1-codex-mini"].tier, "fast");
   });
 });

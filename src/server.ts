@@ -12,6 +12,8 @@ import {
   buildErrorResponse,
   estimateRequestTokens,
   StreamConverter,
+  CODEX_MODELS,
+  proxyConfig,
   type AnthropicRequest,
 } from "./converter.js";
 
@@ -76,12 +78,12 @@ async function handleMessages(
   // Convert request format
   const codexReq = anthropicToCodex(anthropicReq);
 
-  // Build request headers
+  // Build request headers matching what opencode sends
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${session.access_token}`,
-    "User-Agent": "claudex/1.0.0",
-    originator: "claudex",
+    "User-Agent": `claudex/1.0.0 (${process.platform} ${process.arch})`,
+    originator: "codex-cli",
   };
   if (session.account_id) {
     headers["ChatGPT-Account-Id"] = session.account_id;
@@ -275,7 +277,7 @@ export function startServer(port: number): http.Server {
   const server = http.createServer(async (req, res) => {
     // CORS headers for flexibility
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type, Authorization, x-api-key, anthropic-version"
@@ -302,6 +304,43 @@ export function startServer(port: number): http.Server {
       return;
     }
 
+    // Claudex: list available Codex models
+    if (url.pathname === "/claudex/models" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ models: CODEX_MODELS }));
+      return;
+    }
+
+    // Claudex: update runtime configuration
+    if (url.pathname === "/claudex/config" && req.method === "POST") {
+      try {
+        const body = await readBody(req);
+        const config = JSON.parse(body) as Record<string, unknown>;
+        if (typeof config.model === "string") proxyConfig.model = config.model;
+        if (
+          typeof config.reasoning === "string" &&
+          ["low", "medium", "high", ""].includes(config.reasoning)
+        ) {
+          proxyConfig.reasoning = config.reasoning as "" | "low" | "medium" | "high";
+        }
+        logger.info("Runtime config updated", {
+          model: proxyConfig.model || "(auto)",
+          reasoning: proxyConfig.reasoning || "(auto)",
+        });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            model: proxyConfig.model || "(auto)",
+            reasoning: proxyConfig.reasoning || "(auto)",
+          })
+        );
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(buildErrorResponse(400, "Invalid JSON body")));
+      }
+      return;
+    }
+
     // 404 for everything else
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(
@@ -314,6 +353,8 @@ export function startServer(port: number): http.Server {
   server.listen(port, () => {
     logger.info(`Claudex proxy server listening on http://localhost:${port}`);
     logger.info("Route: POST /v1/messages (Anthropic Messages API)");
+    logger.info("Route: GET  /claudex/models");
+    logger.info("Route: POST /claudex/config");
     logger.info("Health: GET /health");
   });
 
