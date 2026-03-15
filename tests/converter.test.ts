@@ -525,6 +525,59 @@ describe("sanitizeToolSchema", () => {
     assert.deepEqual(props.mode.enum, ["read", "write"]);
     assert.equal(props.version.const, 2);
   });
+
+  it("should sanitize nested properties inside anyOf branches", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        value: {
+          anyOf: [
+            {
+              type: "object",
+              properties: {
+                name: { type: "string", format: "hostname" },
+                port: { type: "integer", minimum: 0, maximum: 65535 },
+              },
+              required: ["name"],
+            },
+            { type: "string", format: "uri" },
+          ],
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const value = (result.properties as Record<string, Record<string, unknown>>).value;
+    const anyOf = value.anyOf as Array<Record<string, unknown>>;
+    // First branch: object with properties
+    const branch0Props = anyOf[0].properties as Record<string, Record<string, unknown>>;
+    assert.equal(branch0Props.name.format, undefined);
+    assert.equal(branch0Props.name.type, "string");
+    assert.equal((branch0Props.port as Record<string, unknown>).minimum, undefined);
+    assert.equal((branch0Props.port as Record<string, unknown>).maximum, undefined);
+    // required should include all keys in the branch
+    assert.deepEqual(anyOf[0].required, ["name", "port"]);
+    assert.equal(anyOf[0].additionalProperties, false);
+    // Second branch: format stripped
+    assert.equal(anyOf[1].format, undefined);
+    assert.equal(anyOf[1].type, "string");
+  });
+
+  it("should preserve primitive values inside enum arrays and const", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: ["active", "inactive", null] },
+        count: { type: "integer", const: 42, format: "int32" },
+        flag: { type: "boolean", default: true },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(props.status.enum, ["active", "inactive", null]);
+    assert.equal(props.count.const, 42);
+    assert.equal(props.count.format, undefined); // format still stripped
+    assert.equal(props.flag.default, true);
+  });
 });
 
 describe("anthropicToCodex tool schema sanitization (integration)", () => {
