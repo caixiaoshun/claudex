@@ -11,6 +11,7 @@
 import * as logger from "./logger.js";
 import { LogLevel } from "./logger.js";
 import * as oauth from "./oauth.js";
+import * as token from "./token.js";
 import { startServer } from "./server.js";
 
 const DEFAULT_PORT = 4000;
@@ -30,9 +31,10 @@ function printBanner(): void {
 }
 
 async function main(): Promise<void> {
-  // Parse args
   const args = process.argv.slice(2);
   let port = DEFAULT_PORT;
+  let reuseCodex = false;
+  let listSources = false;
 
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === "--port" || args[i] === "-p") && args[i + 1]) {
@@ -44,6 +46,10 @@ async function main(): Promise<void> {
       i++;
     } else if (args[i] === "--debug") {
       logger.setLogLevel(LogLevel.DEBUG);
+    } else if (args[i] === "--reuse-codex") {
+      reuseCodex = true;
+    } else if (args[i] === "--list-sources") {
+      listSources = true;
     } else if (args[i] === "--help" || args[i] === "-h") {
       printHelp();
       process.exit(0);
@@ -53,7 +59,23 @@ async function main(): Promise<void> {
     }
   }
 
+  // --list-sources: show detected credential files and exit
+  if (listSources) {
+    handleListSources();
+    process.exit(0);
+  }
+
   printBanner();
+
+  // --reuse-codex: import credentials from an existing Codex/opencode installation
+  if (reuseCodex) {
+    const imported = handleReuseCodex();
+    if (!imported) {
+      logger.warn(
+        "No external credentials found. Falling back to OAuth browser flow."
+      );
+    }
+  }
 
   // Step 1: Ensure OAuth session
   logger.info("Checking ChatGPT authorization...");
@@ -70,7 +92,6 @@ async function main(): Promise<void> {
   // Step 2: Start proxy server
   const server = startServer(port);
 
-  // Print usage instructions
   console.log(`
 \x1b[32m✅ Proxy is ready!\x1b[0m
 
@@ -84,7 +105,6 @@ async function main(): Promise<void> {
 \x1b[90mPress Ctrl+C to stop the proxy.\x1b[0m
 `);
 
-  // Graceful shutdown
   const shutdown = () => {
     logger.info("Shutting down...");
     server.close();
@@ -92,6 +112,76 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+/**
+ * Print all detected external credential sources to stdout.
+ * 将所有检测到的外部凭证来源打印到 stdout。
+ */
+function handleListSources(): void {
+  const sources = token.detectExternalSources();
+  if (sources.length === 0) {
+    console.log(
+      "\x1b[33mNo external Codex credential sources found.\x1b[0m\n" +
+        "Searched locations:\n" +
+        "  ~/.codex/auth.json           (OpenAI Codex CLI)\n" +
+        "  ~/.opencode/session.json     (opencode)\n" +
+        "  ~/.opencode/auth/codex.json  (opencode v2)"
+    );
+    return;
+  }
+
+  console.log(
+    `\x1b[32mFound ${sources.length} external credential source(s):\x1b[0m\n`
+  );
+  for (let i = 0; i < sources.length; i++) {
+    const s = sources[i];
+    const expired = token.isExpired(s.session);
+    const expiry = new Date(s.session.expires_at).toLocaleString();
+    const statusLabel = expired
+      ? "\x1b[33m(expired — refresh token will be used)\x1b[0m"
+      : "\x1b[32m(valid)\x1b[0m";
+    console.log(`  [${i + 1}] ${s.name}`);
+    console.log(`      Path     : ${s.path}`);
+    console.log(`      Expires  : ${expiry} ${statusLabel}`);
+    if (s.session.account_id) {
+      console.log(`      Account  : ${s.session.account_id}`);
+    }
+    console.log();
+  }
+  console.log(
+    "Run \x1b[36mclaudex --reuse-codex\x1b[0m to automatically import the first valid source."
+  );
+}
+
+/**
+ * Attempt to import credentials from the first suitable external source.
+ * Returns true if a source was successfully imported.
+ *
+ * 尝试从第一个合适的外部来源导入凭证。
+ * 成功导入返回 true。
+ */
+function handleReuseCodex(): boolean {
+  const sources = token.detectExternalSources();
+
+  if (sources.length === 0) {
+    return false;
+  }
+
+  // Prefer a non-expired source; fall back to the first one (refresh will handle it)
+  const preferred =
+    sources.find((s) => !token.isExpired(s.session)) ?? sources[0];
+
+  logger.info(`Importing credentials from: ${preferred.name}`);
+  logger.info(`  Path: ${preferred.path}`);
+  if (token.isExpired(preferred.session)) {
+    logger.info(
+      "  Access token is expired — will use refresh token to obtain a new one."
+    );
+  }
+
+  token.importExternalSession(preferred);
+  return true;
 }
 
 function printHelp(): void {
@@ -103,6 +193,13 @@ Usage:
 
 Options:
   -p, --port <port>   Port to listen on (default: 4000)
+  --reuse-codex       Import credentials from an existing Codex / opencode
+                      installation instead of launching the browser OAuth flow.
+                      Searches:
+                        ~/.codex/auth.json           (OpenAI Codex CLI)
+                        ~/.opencode/session.json     (opencode)
+                        ~/.opencode/auth/codex.json  (opencode v2)
+  --list-sources      List all detected external credential sources and exit.
   --debug             Enable debug logging
   -h, --help          Show this help message
   -v, --version       Show version
@@ -111,6 +208,16 @@ Environment Variables:
   CODEX_MODEL          Codex model to use (default: gpt-5.3-codex)
   CODEX_API_ENDPOINT   Override Codex API endpoint
   PROXY_PORT           Default port (overridden by --port)
+
+Examples:
+  # First run — open browser for ChatGPT login
+  claudex
+
+  # Reuse credentials from an already-logged-in Codex CLI install
+  claudex --reuse-codex
+
+  # See what credential files were detected on this machine
+  claudex --list-sources
 `);
 }
 
