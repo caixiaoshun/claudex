@@ -357,12 +357,49 @@ function normalizeNestedSchemaValue(key: string, value: unknown): unknown {
 }
 
 /**
+ * Infer the JSON Schema `type` for a normalized schema node when the source
+ * schema omitted it.  The Codex API requires every schema object to have a
+ * `type` field; this function derives the best guess from the keywords that
+ * are already present.
+ *
+ * Rules (applied in order):
+ *  - `properties` present, or `additionalProperties` is a schema object → "object"
+ *  - `items` present → "array"
+ *  - `enum` present → infer from the type of the first enum value
+ *  - `const` present → infer from the type of the const value
+ *  - fallback → "object"
+ */
+function inferType(normalized: Record<string, unknown>): string {
+  if (isRecord(normalized.properties) || isRecord(normalized.additionalProperties)) {
+    return "object";
+  }
+  if (normalized.items !== undefined) {
+    return "array";
+  }
+  if (Array.isArray(normalized.enum) && normalized.enum.length > 0) {
+    const first = normalized.enum[0];
+    if (typeof first === "string") return "string";
+    if (typeof first === "number") return "number";
+    if (typeof first === "boolean") return "boolean";
+  }
+  if (normalized.const !== undefined) {
+    const c = normalized.const;
+    if (typeof c === "string") return "string";
+    if (typeof c === "number") return "number";
+    if (typeof c === "boolean") return "boolean";
+  }
+  return "object";
+}
+
+/**
  * Recursively normalize a JSON Schema node:
  *  1. Keep only whitelisted keywords.
  *  2. Recurse into nested schema-bearing keywords at every depth.
  *  3. At every node with `properties`, ensure `required` includes every
  *     property key, while preserving schema-valued `additionalProperties`.
- *  4. Never mutate the input.
+ *  4. Every schema object node must have a `type` key (Codex API requirement).
+ *     If `type` is absent, infer it from the node's other keywords.
+ *  5. Never mutate the input.
  */
 export function normalizeSchema(node: unknown): unknown {
   if (node === null || node === undefined || typeof node !== "object") {
@@ -395,6 +432,11 @@ export function normalizeSchema(node: unknown): unknown {
     if (!isRecord(normalized.additionalProperties)) {
       normalized.additionalProperties = false;
     }
+  }
+
+  // Rule 4: every schema object node must carry a `type` field.
+  if (normalized.type === undefined) {
+    normalized.type = inferType(normalized);
   }
 
   return normalized;

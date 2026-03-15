@@ -608,6 +608,101 @@ describe("sanitizeToolSchema", () => {
     assert.deepEqual(nested.required, ["preview", "score"]);
   });
 
+  it("should add type: object to schema nodes missing a type field (Codex requirement)", () => {
+    // ExitPlanMode-style: additionalProperties is a schema object with no type
+    const schema = {
+      type: "object",
+      properties: {
+        metadata: {
+          type: "object",
+          additionalProperties: {
+            // intentionally no 'type' — this triggers the Codex 400 error
+            properties: {
+              label: { type: "string" },
+            },
+          },
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const metadata = (result.properties as Record<string, Record<string, unknown>>).metadata;
+    const ap = metadata.additionalProperties as Record<string, unknown>;
+    assert.equal(ap.type, "object"); // inferred from presence of properties
+  });
+
+  it("should infer type: array when schema node has items but no type", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        tags: {
+          // no 'type', but has 'items' → should infer "array"
+          items: { type: "string" },
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const tags = (result.properties as Record<string, Record<string, unknown>>).tags;
+    assert.equal(tags.type, "array");
+  });
+
+  it("should infer type from enum values when type is missing", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        mode: { enum: ["read", "write"] },
+        count: { enum: [1, 2, 3] },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.equal(props.mode.type, "string");
+    assert.equal(props.count.type, "number");
+  });
+
+  it("should infer type from const value when type is missing", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        version: { const: 2 },
+        name: { const: "default" },
+        flag: { const: true },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+    assert.equal(props.version.type, "number");
+    assert.equal(props.name.type, "string");
+    assert.equal(props.flag.type, "boolean");
+  });
+
+  it("should add type: object to schema node with anyOf when type is missing", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        value: {
+          // no type at this level — only anyOf
+          anyOf: [
+            { type: "string" },
+            { type: "number" },
+          ],
+        },
+      },
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const value = (result.properties as Record<string, Record<string, unknown>>).value;
+    // No properties/items/enum/const → defaults to "object"
+    assert.equal(value.type, "object");
+  });
+
+  it("should not overwrite an existing type field", () => {
+    const schema = {
+      type: "string",
+      description: "a string field",
+    };
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    assert.equal(result.type, "string");
+  });
+
   it("should strip unsupported recursive schema containers without mutating the input", () => {
     const schema = {
       type: "object",
