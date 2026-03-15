@@ -4,6 +4,7 @@
 
 **Bridge Claude Code to ChatGPT Codex — use your ChatGPT subscription as the backend for Claude Code.**
 
+[![npm version](https://img.shields.io/npm/v/@caixiaoshun/claudex.svg)](https://www.npmjs.com/package/@caixiaoshun/claudex)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg)](https://nodejs.org/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)](https://www.typescriptlang.org/)
@@ -31,6 +32,7 @@ It works by intercepting Claude Code's API requests, translating them from Anthr
 
 - 🔄 **Bidirectional Format Conversion** — Anthropic Messages API ↔ OpenAI Responses API, automatic and transparent
 - 🔐 **OAuth Authorization** — Browser-based PKCE flow for secure ChatGPT login, no API keys to manage
+- ♻️ **Reuse Existing Credentials** — If you already use Codex CLI or opencode, import their session with one flag — no browser login needed
 - 💾 **Token Persistence** — Sessions cached locally at `~/.codex-proxy/session.json` with auto-refresh
 - 🌊 **SSE Streaming** — Full streaming support, converting Codex events to Anthropic `text_delta` format in real-time
 - 🛠️ **Tool/Function Calling** — Best-effort conversion of Anthropic tool definitions to OpenAI function calling format
@@ -42,29 +44,72 @@ It works by intercepting Claude Code's API requests, translating them from Anthr
 
 ## 🚀 Quick Start
 
-### 1. Clone and Build
+### 1. Install
+
+**Option A — from npm (recommended):**
+
+```bash
+npm install -g @caixiaoshun/claudex
+```
+
+**Option B — build from source:**
 
 ```bash
 git clone https://github.com/caixiaoshun/claudex.git
 cd claudex
 npm install
 npm run build
+npm install -g .
 ```
+
+---
 
 ### 2. Start the Proxy
 
+**If you already use Codex CLI or opencode** (see [Reuse Existing Credentials](#-reuse-existing-credentials)):
+
 ```bash
-node dist/index.js
+claudex --reuse-codex
 ```
 
-On first run, your browser will open for ChatGPT authorization. Log in and approve access — the token is cached for future use.
+**Otherwise**, start the proxy and complete the browser login:
+
+```bash
+claudex
+```
+
+Your browser will open for ChatGPT authorization. Log in and approve access — the token is cached for future runs.
+
+---
 
 ### 3. Configure Claude Code
+
+Point Claude Code at the local proxy by setting two environment variables. Keep the proxy terminal running and open a **new terminal** for this step.
+
+**macOS / Linux:**
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:4000
 export ANTHROPIC_API_KEY=placeholder
 ```
+
+**Windows — PowerShell:**
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://localhost:4000"
+$env:ANTHROPIC_API_KEY  = "placeholder"
+```
+
+**Windows — Command Prompt (cmd.exe):**
+
+```cmd
+set ANTHROPIC_BASE_URL=http://localhost:4000
+set ANTHROPIC_API_KEY=placeholder
+```
+
+> **Note:** Variables set this way only apply to the current terminal session. To make them permanent, see [Persisting Environment Variables](#-persisting-environment-variables).
+
+---
 
 ### 4. Use Claude Code Normally
 
@@ -76,6 +121,80 @@ That's it! Claude Code talks to Claudex, Claudex talks to ChatGPT Codex. 🎉
 
 ---
 
+## 💾 Persisting Environment Variables
+
+Avoid re-running the variable commands every time by making them permanent.
+
+**macOS / Linux** — add to your shell profile (`~/.zshrc`, `~/.bashrc`, etc.):
+
+```bash
+echo 'export ANTHROPIC_BASE_URL=http://localhost:4000' >> ~/.zshrc
+echo 'export ANTHROPIC_API_KEY=placeholder'            >> ~/.zshrc
+source ~/.zshrc
+```
+
+**Windows — PowerShell (permanent, current user):**
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://localhost:4000", "User")
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY",  "placeholder",           "User")
+```
+
+**Windows — System Properties GUI:**
+
+1. Open **Start** → search **"Edit environment variables for your account"**
+2. Click **New** and add each variable:
+   - `ANTHROPIC_BASE_URL` = `http://localhost:4000`
+   - `ANTHROPIC_API_KEY` = `placeholder`
+3. Click **OK** and restart your terminal
+
+---
+
+## ♻️ Reuse Existing Credentials
+
+If you already have **OpenAI Codex CLI** or **opencode** installed and logged in, Claudex can import their saved session — skipping the browser OAuth flow entirely.
+
+### Check what's available
+
+```bash
+claudex --list-sources
+```
+
+Example output:
+
+```
+Found 2 external credential source(s):
+
+  [1] OpenAI Codex CLI (~/.codex/auth.json)
+      Path     : /Users/you/.codex/auth.json
+      Expires  : 3/16/2026, 9:00:00 AM (valid)
+      Account  : user_abc123
+
+  [2] opencode (~/.opencode/session.json)
+      Path     : /Users/you/.opencode/session.json
+      Expires  : 3/15/2026, 6:00:00 AM (expired — refresh token will be used)
+
+Run claudex --reuse-codex to automatically import the first valid source.
+```
+
+### Import and start
+
+```bash
+claudex --reuse-codex
+```
+
+Claudex picks the first non-expired source automatically. If the access token has expired, it silently uses the refresh token to obtain a new one — no browser window needed.
+
+### Supported credential locations
+
+| Tool | macOS / Linux | Windows |
+|---|---|---|
+| OpenAI Codex CLI | `~/.codex/auth.json` | `%USERPROFILE%\.codex\auth.json` |
+| opencode | `~/.opencode/session.json` | `%USERPROFILE%\.opencode\session.json` |
+| opencode v2 | `~/.opencode/auth/codex.json` | `%USERPROFILE%\.opencode\auth\codex.json` |
+
+---
+
 ## ⚙️ Configuration
 
 ### Command Line Options
@@ -83,6 +202,8 @@ That's it! Claude Code talks to Claudex, Claudex talks to ChatGPT Codex. 🎉
 | Option | Description | Default |
 |---|---|---|
 | `-p, --port <port>` | Port for the proxy server | `4000` |
+| `--reuse-codex` | Import credentials from an existing Codex / opencode installation | off |
+| `--list-sources` | List all detected external credential sources and exit | — |
 | `--debug` | Enable verbose debug logging | off |
 | `-h, --help` | Show help message | — |
 | `-v, --version` | Show version | — |
@@ -126,16 +247,23 @@ Request Flow:
   4. Response streamed back, converted to Anthropic SSE events
   5. Claude Code receives familiar Anthropic-format response
 
-Auth Flow (first run):
+Auth Flow — Browser (first run, no existing credentials):
   1. Claudex opens browser → auth.openai.com (PKCE OAuth)
   2. User logs in with ChatGPT account
-  3. Callback received, tokens exchanged and cached
+  3. Callback received, tokens exchanged and cached at ~/.codex-proxy/session.json
   4. Auto-refresh on expiry, no manual intervention needed
+
+Auth Flow — Reuse (--reuse-codex):
+  1. Claudex scans known credential locations (see table above)
+  2. Imports the first valid session into ~/.codex-proxy/session.json
+  3. If access token is expired, refresh token is used automatically
+  4. No browser window opened
 ```
 
 ### Format Conversion Details
 
 **Request Mapping:**
+
 | Anthropic | → | OpenAI Responses API |
 |---|---|---|
 | `messages[]` | → | `input[]` |
@@ -145,6 +273,7 @@ Auth Flow (first run):
 | `stream: true` | → | `stream: true` |
 
 **Streaming Event Mapping:**
+
 | Codex Event | → | Anthropic Event |
 |---|---|---|
 | `response.output_text.delta` | → | `content_block_delta` (text_delta) |
@@ -159,10 +288,10 @@ Auth Flow (first run):
 ```
 claudex/
 ├── src/
-│   ├── index.ts        # CLI entry point & argument parsing
+│   ├── index.ts        # CLI entry point, argument parsing, --reuse-codex / --list-sources
 │   ├── server.ts       # HTTP proxy server (POST /v1/messages)
 │   ├── oauth.ts        # ChatGPT OAuth (PKCE flow + token refresh)
-│   ├── token.ts        # Session persistence (~/.codex-proxy/session.json)
+│   ├── token.ts        # Session persistence + external credential detection
 │   ├── converter.ts    # Bidirectional format converter + SSE stream converter
 │   └── logger.ts       # Structured logging with colors
 ├── tests/
