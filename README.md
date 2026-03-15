@@ -298,6 +298,7 @@ Claude Code  →  POST /v1/messages (Anthropic format)
   Claudex Proxy (localhost:4000)
      │
      ├─ Strip Anthropic-specific fields (betas, metadata, thinking, etc.)
+     ├─ Sanitize tool schemas: whitelist-filter JSON Schema keywords, strip unsupported ones
      ├─ Convert tools: enforce required=all property keys, strict=true
      ├─ Map model: opus→max, sonnet→balanced, haiku→mini
      ├─ Build Codex request: model, instructions, input, tools, store=false
@@ -314,7 +315,7 @@ Claude Code  →  POST /v1/messages (Anthropic format)
 
 ### Key Implementation Details
 
-**Tool Schema Conversion:** The Codex API requires `required` to include every key present in `properties`, `additionalProperties: false`, and `strict: true`. Claude Code doesn't always guarantee this, so Claudex always enforces it before forwarding.
+**Tool Schema Sanitization:** Tool parameter schemas are recursively sanitized using a **whitelist filter** before forwarding to the Codex API. Only accepted JSON Schema keywords (`type`, `description`, `properties`, `required`, `additionalProperties`, `items`, `anyOf`, `oneOf`, `allOf`, `enum`, `const`, `default`, `nullable`, `title`) are kept — everything else (e.g., `format`, `$schema`, `$id`, `$ref`, `examples`, `pattern`, `minLength`, `maxLength`, `contentEncoding`, `contentMediaType`, etc.) is silently stripped. This prevents the entire class of "Invalid schema" 400 errors. Additionally, `required` is enforced to include every key in `properties` and `additionalProperties` is set to `false` at every nesting level.
 
 **Field Stripping:** Only whitelisted fields are forwarded to Codex: `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`. Everything else is stripped.
 
