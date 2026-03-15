@@ -1,6 +1,5 @@
 /**
- * HTTP proxy server — receives Anthropic format, forwards to Codex, returns Anthropic format
- * HTTP 代理服务器 — 接收 Anthropic 格式请求，转发到 Codex，返回 Anthropic 格式响应
+ * HTTP proxy server — receives Anthropic format, forwards to Codex, returns Anthropic format.
  */
 
 import * as http from "node:http";
@@ -12,7 +11,6 @@ import {
   buildErrorResponse,
   estimateRequestTokens,
   StreamConverter,
-  CODEX_MODELS,
   proxyConfig,
   type AnthropicRequest,
 } from "./converter.js";
@@ -27,9 +25,6 @@ const CODEX_API_ENDPOINT =
   process.env.CODEX_API_ENDPOINT ||
   "https://chatgpt.com/backend-api/codex/responses";
 
-/**
- * Read the full request body as JSON.
- */
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -40,8 +35,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 }
 
 /**
- * Handle POST /v1/messages — the main proxy route.
- * 处理 POST /v1/messages — 主要的代理路由。
+ * Handle POST /v1/messages — main proxy route.
  */
 async function handleMessages(
   req: http.IncomingMessage,
@@ -76,7 +70,9 @@ async function handleMessages(
     logger.error("Auth error", { error: msg });
     res.writeHead(401, { "Content-Type": "application/json" });
     res.end(
-      JSON.stringify(buildErrorResponse(401, `Authentication failed: ${msg}`))
+      JSON.stringify(
+        buildErrorResponse(401, `Authentication failed: ${msg}`)
+      )
     );
     return;
   }
@@ -84,7 +80,7 @@ async function handleMessages(
   // Convert request format
   const codexReq = anthropicToCodex(anthropicReq);
 
-  // Build request headers matching what opencode sends
+  // Build headers matching opencode's pattern
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Authorization: `Bearer ${session.access_token}`,
@@ -96,18 +92,35 @@ async function handleMessages(
   }
 
   try {
-    const codexRes = await fetch(CODEX_API_ENDPOINT, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(codexReq),
-    });
+    let codexRes: Response;
+    try {
+      codexRes = await fetch(CODEX_API_ENDPOINT, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(codexReq),
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error("Codex API fetch failed", { error: msg });
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          buildErrorResponse(502, `Codex API unreachable: ${msg}`)
+        )
+      );
+      return;
+    }
 
     if (!codexRes.ok) {
       const errorText = await codexRes.text().catch(() => "Unknown error");
       logger.error(`Codex API error: ${codexRes.status}`, {
         body: errorText.slice(0, 500),
       });
-      logger.requestLog(anthropicReq.model, estimatedTokens, `error:${codexRes.status}`);
+      logger.requestLog(
+        anthropicReq.model,
+        estimatedTokens,
+        `error:${codexRes.status}`
+      );
 
       const statusMap: Record<number, number> = {
         401: 401,
@@ -117,7 +130,9 @@ async function handleMessages(
       };
       const anthropicStatus = statusMap[codexRes.status] || 502;
 
-      res.writeHead(anthropicStatus, { "Content-Type": "application/json" });
+      res.writeHead(anthropicStatus, {
+        "Content-Type": "application/json",
+      });
       res.end(
         JSON.stringify(
           buildErrorResponse(
@@ -137,26 +152,36 @@ async function handleMessages(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Proxy error", { error: msg });
-    res.writeHead(500, { "Content-Type": "application/json" });
+    if (!res.headersSent) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+    }
     res.end(
       JSON.stringify(buildErrorResponse(500, `Proxy error: ${msg}`))
     );
   }
 }
 
-/**
- * Handle non-streaming response.
- */
 async function handleSyncResponse(
   codexRes: Response,
   res: http.ServerResponse,
   anthropicReq: AnthropicRequest
 ): Promise<void> {
-  const body = await codexRes.json();
-  const anthropicRes = codexToAnthropic(
-    body as Record<string, unknown>,
-    anthropicReq.model
-  );
+  let body: Record<string, unknown>;
+  try {
+    body = (await codexRes.json()) as Record<string, unknown>;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error("Failed to parse Codex response", { error: msg });
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify(
+        buildErrorResponse(502, `Failed to parse Codex response: ${msg}`)
+      )
+    );
+    return;
+  }
+
+  const anthropicRes = codexToAnthropic(body, anthropicReq.model);
 
   logger.requestLog(
     anthropicReq.model,
@@ -169,8 +194,7 @@ async function handleSyncResponse(
 }
 
 /**
- * Handle streaming response — convert Codex SSE to Anthropic SSE format.
- * 处理流式响应 — 将 Codex SSE 转换为 Anthropic SSE 格式。
+ * Handle streaming response — convert Codex SSE → Anthropic SSE.
  */
 async function handleStreamResponse(
   codexRes: Response,
@@ -196,15 +220,23 @@ async function handleStreamResponse(
 
     const decoder = new TextDecoder();
     let buffer = "";
-    let gotCompletion = false;
 
     while (true) {
-      const { done, value } = await reader.read();
+      let readResult: { done: boolean; value?: Uint8Array };
+      try {
+        readResult = await reader.read();
+      } catch (err) {
+        logger.error("Stream read error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        break;
+      }
+
+      const { done, value } = readResult;
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
 
-      // Process complete SSE events (terminated by double newline)
       const parts = buffer.split("\n\n");
       buffer = parts.pop() || "";
 
@@ -220,20 +252,17 @@ async function handleStreamResponse(
           for (const ev of events) {
             res.write(ev);
           }
-          if (event === "response.completed") {
-            gotCompletion = true;
-          }
         } catch {
-          logger.debug("Skipping unparseable SSE data", { raw: data.slice(0, 100) });
+          logger.debug("Skipping unparseable SSE data", {
+            raw: data.slice(0, 100),
+          });
         }
       }
     }
 
-    // Finalize if no proper completion event was received
-    if (!gotCompletion) {
-      const events = converter.finalize();
-      for (const ev of events) res.write(ev);
-    }
+    // Finalize if converter hasn't finished
+    const finalEvents = converter.finalize();
+    for (const ev of finalEvents) res.write(ev);
 
     logger.requestLog(
       anthropicReq.model,
@@ -244,7 +273,6 @@ async function handleStreamResponse(
     logger.error("Stream error", {
       error: err instanceof Error ? err.message : String(err),
     });
-    // Try to send a final event so the client doesn't hang
     const events = converter.finalize();
     for (const ev of events) res.write(ev);
   }
@@ -252,9 +280,6 @@ async function handleStreamResponse(
   res.end();
 }
 
-/**
- * Parse a raw SSE event string into event type and data.
- */
 function parseSSEEvent(raw: string): { event: string; data: string | null } {
   let event = "";
   const dataLines: string[] = [];
@@ -276,12 +301,11 @@ function parseSSEEvent(raw: string): { event: string; data: string | null } {
 }
 
 /**
- * Start the proxy server on the given port.
- * 在指定端口启动代理服务器。
+ * Start the proxy server.
  */
 export function startServer(port: number): http.Server {
   const server = http.createServer(async (req, res) => {
-    // CORS headers for flexibility
+    // CORS
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
@@ -310,7 +334,7 @@ export function startServer(port: number): http.Server {
       return;
     }
 
-    // Claudex: list available Codex models
+    // List available Codex models
     if (url.pathname === "/claudex/models" && req.method === "GET") {
       const models = getModels();
       const tierMapping = getTierMapping();
@@ -328,8 +352,11 @@ export function startServer(port: number): http.Server {
       return;
     }
 
-    // Claudex: refresh model list at runtime
-    if (url.pathname === "/claudex/models/refresh" && req.method === "POST") {
+    // Refresh model list
+    if (
+      url.pathname === "/claudex/models/refresh" &&
+      req.method === "POST"
+    ) {
       try {
         const session = await oauth.getValidSession();
         const success = await refreshModels(
@@ -361,17 +388,22 @@ export function startServer(port: number): http.Server {
       return;
     }
 
-    // Claudex: update runtime configuration
+    // Update runtime configuration
     if (url.pathname === "/claudex/config" && req.method === "POST") {
       try {
         const body = await readBody(req);
         const config = JSON.parse(body) as Record<string, unknown>;
-        if (typeof config.model === "string") proxyConfig.model = config.model;
+        if (typeof config.model === "string")
+          proxyConfig.model = config.model;
         if (
           typeof config.reasoning === "string" &&
           ["low", "medium", "high", ""].includes(config.reasoning)
         ) {
-          proxyConfig.reasoning = config.reasoning as "" | "low" | "medium" | "high";
+          proxyConfig.reasoning = config.reasoning as
+            | ""
+            | "low"
+            | "medium"
+            | "high";
         }
         logger.info("Runtime config updated", {
           model: proxyConfig.model || "(auto)",
@@ -386,22 +418,29 @@ export function startServer(port: number): http.Server {
         );
       } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(buildErrorResponse(400, "Invalid JSON body")));
+        res.end(
+          JSON.stringify(buildErrorResponse(400, "Invalid JSON body"))
+        );
       }
       return;
     }
 
-    // 404 for everything else
+    // 404
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify(
-        buildErrorResponse(404, `Unknown route: ${req.method} ${url.pathname}`)
+        buildErrorResponse(
+          404,
+          `Unknown route: ${req.method} ${url.pathname}`
+        )
       )
     );
   });
 
   server.listen(port, () => {
-    logger.info(`Claudex proxy server listening on http://localhost:${port}`);
+    logger.info(
+      `Claudex proxy server listening on http://localhost:${port}`
+    );
     logger.info("Route: POST /v1/messages (Anthropic Messages API)");
     logger.info("Route: GET  /claudex/models");
     logger.info("Route: POST /claudex/models/refresh");
