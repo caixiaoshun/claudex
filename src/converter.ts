@@ -71,16 +71,42 @@ export interface AnthropicMessage {
   content: string | AnthropicContentBlock[];
 }
 
+export interface AnthropicJsonSchema {
+  type?: string | string[];
+  description?: string;
+  properties?: Record<string, AnthropicJsonSchema>;
+  required?: string[];
+  additionalProperties?: boolean | AnthropicJsonSchema;
+  items?: AnthropicJsonSchema | AnthropicJsonSchema[];
+  anyOf?: AnthropicJsonSchema[];
+  oneOf?: AnthropicJsonSchema[];
+  allOf?: AnthropicJsonSchema[];
+  enum?: unknown[];
+  const?: unknown;
+  default?: unknown;
+  nullable?: boolean;
+  title?: string;
+  patternProperties?: Record<string, AnthropicJsonSchema>;
+  $defs?: Record<string, AnthropicJsonSchema>;
+  definitions?: Record<string, AnthropicJsonSchema>;
+  dependentSchemas?: Record<string, AnthropicJsonSchema>;
+  prefixItems?: AnthropicJsonSchema[];
+  not?: AnthropicJsonSchema;
+  if?: AnthropicJsonSchema;
+  then?: AnthropicJsonSchema;
+  else?: AnthropicJsonSchema;
+  contains?: AnthropicJsonSchema;
+  propertyNames?: AnthropicJsonSchema;
+  unevaluatedProperties?: boolean | AnthropicJsonSchema;
+  unevaluatedItems?: boolean | AnthropicJsonSchema;
+  contentSchema?: AnthropicJsonSchema;
+  [key: string]: unknown;
+}
+
 export interface AnthropicTool {
   name: string;
   description?: string;
-  input_schema?: {
-    type?: string;
-    properties?: Record<string, unknown>;
-    required?: string[];
-    additionalProperties?: boolean;
-    [key: string]: unknown;
-  };
+  input_schema?: AnthropicJsonSchema;
 }
 
 export interface AnthropicRequest {
@@ -126,10 +152,29 @@ export interface CodexInputMessage {
   content: unknown;
 }
 
+export interface CodexFunctionCallInput {
+  type: "function_call";
+  id?: string;
+  call_id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface CodexFunctionCallOutputInput {
+  type: "function_call_output";
+  call_id: string;
+  output: string;
+}
+
+export type CodexInputItem =
+  | CodexInputMessage
+  | CodexFunctionCallInput
+  | CodexFunctionCallOutputInput;
+
 export interface CodexRequest {
   model: string;
   instructions: string;
-  input: CodexInputMessage[];
+  input: CodexInputItem[];
   tools?: CodexTool[];
   tool_choice?: string;
   parallel_tool_calls?: boolean;
@@ -236,8 +281,6 @@ const ALLOWED_SCHEMA_KEYWORDS = new Set<string>([
   "additionalProperties",
   "items",
   "anyOf",
-  "oneOf",
-  "allOf",
   "enum",
   "const",
   "default",
@@ -298,14 +341,68 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isPureRecordContainer(schema: Record<string, unknown>): boolean {
+  return (
+    schema.type === "object" &&
+    !isRecord(schema.properties) &&
+    schema.items === undefined &&
+    isRecord(schema.additionalProperties)
+  );
+}
+
+function hasPropertyKeys(schema: Record<string, unknown>): boolean {
+  return (
+    isRecord(schema.properties) && Object.keys(schema.properties).length > 0
+  );
+}
+
+function isDegenerateObjectShell(schema: Record<string, unknown>): boolean {
+  return (
+    schema.type === "object" &&
+    !hasPropertyKeys(schema) &&
+    schema.items === undefined &&
+    !Array.isArray(schema.anyOf) &&
+    schema.enum === undefined &&
+    schema.const === undefined &&
+    !isRecord(schema.additionalProperties)
+  );
+}
+
+function shouldRequireProperty(schema: unknown): boolean {
+  if (!isRecord(schema)) {
+    return true;
+  }
+
+  // Codex rejects pure record/map container properties in `required`.
+  if (isPureRecordContainer(schema)) {
+    return false;
+  }
+
+  // Codex also rejects object shells that lost their structural shape after
+  // unsupported keywords such as `oneOf` / `allOf` were stripped.
+  if (isDegenerateObjectShell(schema)) {
+    return false;
+  }
+
+  return true;
+}
+
 function mergeRequiredKeys(
   required: unknown,
-  propertyKeys: string[]
+  properties: Record<string, unknown>
 ): string[] {
+  const propertyKeys = Object.entries(properties)
+    .filter(([, schema]) => shouldRequireProperty(schema))
+    .map(([key]) => key);
+  const allowed = new Set(propertyKeys);
   const merged: string[] = [];
   if (Array.isArray(required)) {
     for (const entry of required) {
-      if (typeof entry === "string" && !merged.includes(entry)) {
+      if (
+        typeof entry === "string" &&
+        allowed.has(entry) &&
+        !merged.includes(entry)
+      ) {
         merged.push(entry);
       }
     }
@@ -356,50 +453,25 @@ function normalizeNestedSchemaValue(key: string, value: unknown): unknown {
   return value;
 }
 
-/**
- * Infer the JSON Schema `type` for a normalized schema node when the source
- * schema omitted it.  The Codex API requires every schema object to have a
- * `type` field; this function derives the best guess from the keywords that
- * are already present.
- *
- * Rules (applied in order):
- *  - `properties` present, or `additionalProperties` is a schema object → "object"
- *  - `items` present → "array"
- *  - `enum` present → infer from the type of the first enum value
- *  - `const` present → infer from the type of the const value
- *  - fallback → "object"
- */
+/** Infer the JSON Schema `type` for a schema node when the source omitted it. */
 function inferType(normalized: Record<string, unknown>): string {
-  if (isRecord(normalized.properties) || isRecord(normalized.additionalProperties)) {
+  if (isRecord(normalized.properties)) {
     return "object";
   }
   if (normalized.items !== undefined) {
     return "array";
   }
-  if (Array.isArray(normalized.enum) && normalized.enum.length > 0) {
-    const first = normalized.enum[0];
-    if (typeof first === "string") return "string";
-    if (typeof first === "number") return "number";
-    if (typeof first === "boolean") return "boolean";
-  }
-  if (normalized.const !== undefined) {
-    const c = normalized.const;
-    if (typeof c === "string") return "string";
-    if (typeof c === "number") return "number";
-    if (typeof c === "boolean") return "boolean";
-  }
   return "object";
 }
 
 /**
- * Recursively normalize a JSON Schema node:
- *  1. Keep only whitelisted keywords.
- *  2. Recurse into nested schema-bearing keywords at every depth.
- *  3. At every node with `properties`, ensure `required` includes every
- *     property key, while preserving schema-valued `additionalProperties`.
- *  4. Every schema object node must have a `type` key (Codex API requirement).
- *     If `type` is absent, infer it from the node's other keywords.
- *  5. Never mutate the input.
+ * Recursively normalize a JSON Schema node bottom-up:
+ *  1. Recurse into nested schema-bearing children.
+ *  2. Add a missing `type`.
+ *  3. Normalize `required` to the exact set of Codex-counted property keys.
+ *  4. Force `additionalProperties: false` on every non-record object node.
+ *  5. Drop all non-whitelisted fields, including rejected combinators such
+ *     as `oneOf` / `allOf`.
  */
 export function normalizeSchema(node: unknown): unknown {
   if (node === null || node === undefined || typeof node !== "object") {
@@ -410,33 +482,42 @@ export function normalizeSchema(node: unknown): unknown {
   }
 
   const source = node as Record<string, unknown>;
-  const normalized: Record<string, unknown> = {};
+  const normalizedChildren: Record<string, unknown> = {};
 
   for (const [key, rawValue] of Object.entries(source)) {
-    // Normalize nested schema-bearing containers first so unsupported wrapper
-    // keywords do not block recursion into the schema tree.
     const value = normalizeNestedSchemaValue(key, rawValue);
+    if (value !== undefined) {
+      normalizedChildren[key] = value;
+    }
+  }
+
+  const withType: Record<string, unknown> =
+    normalizedChildren.type === undefined
+      ? { ...normalizedChildren, type: inferType(normalizedChildren) }
+      : { ...normalizedChildren };
+
+  const normalizedProperties = withType.properties;
+  let withRequired = withType;
+  if (isRecord(normalizedProperties)) {
+    withRequired = {
+      ...withType,
+      required: mergeRequiredKeys(withType.required, normalizedProperties),
+    };
+  }
+
+  const withAdditionalProperties =
+    withRequired.type === "object" && !isPureRecordContainer(withRequired)
+      ? { ...withRequired, additionalProperties: false }
+      : withRequired;
+
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(withAdditionalProperties)) {
     if (!ALLOWED_SCHEMA_KEYWORDS.has(key)) {
       continue;
     }
     if (value !== undefined) {
       normalized[key] = value;
     }
-  }
-
-  const normalizedProperties = normalized.properties;
-  if (isRecord(normalizedProperties)) {
-    const propertyKeys = Object.keys(normalizedProperties);
-    normalized.required = mergeRequiredKeys(normalized.required, propertyKeys);
-
-    if (!isRecord(normalized.additionalProperties)) {
-      normalized.additionalProperties = false;
-    }
-  }
-
-  // Rule 4: every schema object node must carry a `type` field.
-  if (normalized.type === undefined) {
-    normalized.type = inferType(normalized);
   }
 
   return normalized;
@@ -459,7 +540,7 @@ function normalizeCodexRequestBody(req: CodexRequest): CodexRequest {
  * Convert an Anthropic tool definition to a Codex Responses API tool.
  * The Codex API requires:
  * - flat format: { type: "function", name, description, strict: true, parameters }
- * - `required` must include EVERY key in `properties`
+ * - `required` must match the backend-recognized required property set
  * - `additionalProperties` must be false
  * - `strict` must be true
  * - Only whitelisted JSON Schema keywords in parameter schemas
@@ -478,11 +559,9 @@ function convertTool(tool: AnthropicTool): CodexTool {
   parameters.type = "object";
   parameters.required = mergeRequiredKeys(
     parameters.required,
-    Object.keys(parameters.properties as Record<string, unknown>)
+    parameters.properties as Record<string, unknown>
   );
-  if (!isRecord(parameters.additionalProperties)) {
-    parameters.additionalProperties = false;
-  }
+  parameters.additionalProperties = false;
 
   return {
     type: "function",
@@ -499,8 +578,8 @@ function convertTool(tool: AnthropicTool): CodexTool {
 
 function convertMessages(
   messages: AnthropicMessage[]
-): CodexInputMessage[] {
-  const result: CodexInputMessage[] = [];
+): CodexInputItem[] {
+  const result: CodexInputItem[] = [];
 
   for (const msg of messages) {
     if (typeof msg.content === "string") {
@@ -511,18 +590,8 @@ function convertMessages(
     // Array content blocks
     const blocks = msg.content;
     const textParts: string[] = [];
-    const functionCalls: Array<{
-      type: "function_call";
-      id: string;
-      call_id: string;
-      name: string;
-      arguments: string;
-    }> = [];
-    const functionOutputs: Array<{
-      type: "function_call_output";
-      call_id: string;
-      output: string;
-    }> = [];
+    const functionCalls: CodexFunctionCallInput[] = [];
+    const functionOutputs: CodexFunctionCallOutputInput[] = [];
 
     for (const block of blocks) {
       switch (block.type) {
@@ -534,7 +603,6 @@ function convertMessages(
           const callId = block.id || `call_${crypto.randomUUID()}`;
           functionCalls.push({
             type: "function_call",
-            id: callId,
             call_id: callId,
             name: block.name,
             arguments:
@@ -578,39 +646,24 @@ function convertMessages(
 
     // Emit assistant messages
     if (msg.role === "assistant") {
-      if (textParts.length > 0 && functionCalls.length > 0) {
-        // Mixed text + function calls: emit as array of content items
-        const content: unknown[] = [];
-        if (textParts.length > 0) {
-          content.push({
-            type: "output_text",
-            text: textParts.join("\n"),
-          });
-        }
-        for (const fc of functionCalls) {
-          content.push(fc);
-        }
-        result.push({ role: "assistant", content });
-      } else if (functionCalls.length > 0) {
-        // Only function calls
-        const content = functionCalls.map((fc) => fc);
-        result.push({ role: "assistant", content });
-      } else {
+      if (textParts.length > 0) {
         result.push({
           role: "assistant",
           content: textParts.join("\n"),
         });
+      }
+
+      for (const fc of functionCalls) {
+        result.push(fc);
       }
     }
 
     // Emit user messages
     if (msg.role === "user") {
       if (functionOutputs.length > 0) {
-        // Tool results go as separate items
         for (const fo of functionOutputs) {
-          result.push({ role: "user", content: fo });
+          result.push(fo);
         }
-        // Any remaining text
         if (textParts.length > 0) {
           result.push({
             role: "user",

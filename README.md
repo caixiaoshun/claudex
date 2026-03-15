@@ -80,21 +80,21 @@ Set these environment variables before running Claude Code:
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:4000
-export ANTHROPIC_API_KEY=placeholder
+export ANTHROPIC_API_KEY=sk-ant-placeholder
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://localhost:4000"
-$env:ANTHROPIC_API_KEY = "placeholder"
+$env:ANTHROPIC_API_KEY = "sk-ant-placeholder"
 ```
 
 **Windows (CMD):**
 
 ```cmd
 set ANTHROPIC_BASE_URL=http://localhost:4000
-set ANTHROPIC_API_KEY=placeholder
+set ANTHROPIC_API_KEY=sk-ant-placeholder
 ```
 
 ### Step 4: Use Claude Code Normally
@@ -128,6 +128,51 @@ To see which credential files are detected:
 ```bash
 claudex --list-sources
 ```
+
+---
+
+## Windows E2E Verification
+
+To validate a source checkout against a real Claude Code session on Windows:
+
+1. Build the project:
+
+```powershell
+npm install
+npm run build
+```
+
+2. Start the proxy with credential reuse and debug logging:
+
+```powershell
+claudex --reuse-codex --debug
+```
+
+3. In a second PowerShell window, point Claude Code at the local proxy:
+
+```powershell
+$env:ANTHROPIC_BASE_URL = "http://localhost:4000"
+$env:ANTHROPIC_API_KEY = "sk-ant-placeholder"
+```
+
+If Claude Code's local `WebFetch` tool fails on Windows with `unable to get local issuer certificate`, that is a local Node.js trust-store issue rather than a Claudex proxy issue. For a quick validation-only workaround, launch Claude Code with:
+
+```powershell
+$env:NODE_TLS_REJECT_UNAUTHORIZED = "0"
+```
+
+Prefer installing the correct enterprise/root certificate for a permanent fix.
+
+4. Run Claude Code and exercise the built-in tools with prompts such as:
+
+- `Run "pwd" and tell me the result.`
+- `Fetch https://example.com and summarize it.`
+- `Delegate a small subtask to another agent and return its summary.`
+- `Plan a small code change, ask me one multiple-choice clarification if needed, then exit plan mode for approval.`
+- `Create and maintain a todo list while doing a multi-step task.`
+- `Read a scratch file, make a small edit, and show the result.`
+
+Successful validation means the entire session completes with streamed output visible in Claude Code, tool results render normally, and the proxy debug log shows zero `Codex API error: 400` entries.
 
 ---
 
@@ -215,6 +260,12 @@ Models are refreshed automatically every hour by default. Configure with:
 CODEX_MODEL_REFRESH_INTERVAL=1800000 claudex  # 30 minutes
 ```
 
+If your network to `chatgpt.com` is flaky, you can also tune upstream response retries:
+
+```bash
+CODEX_API_FETCH_RETRIES=5 CODEX_API_FETCH_RETRY_DELAY_MS=1500 claudex
+```
+
 ---
 
 ## All API Endpoints
@@ -299,7 +350,7 @@ Claude Code  →  POST /v1/messages (Anthropic format)
      │
      ├─ Strip Anthropic-specific fields (betas, metadata, thinking, etc.)
      ├─ Normalize tool schemas recursively at every nesting level
-     ├─ Convert tools: enforce required=all property keys, preserve schema-valued additionalProperties, strict=true
+     ├─ Convert tools: enforce backend-compatible required keys, force additionalProperties=false on object schemas, strict=true
      ├─ Map model: opus→max, sonnet→balanced, haiku→mini
      ├─ Build Codex request: model, instructions, input, tools, store=false
      │
@@ -315,11 +366,13 @@ Claude Code  →  POST /v1/messages (Anthropic format)
 
 ### Key Implementation Details
 
-**Tool Schema Normalization:** Tool parameter schemas are recursively normalized at **every schema node** before forwarding to the Codex API. Claudex walks nested `properties`, schema-valued `additionalProperties`, `items`, `anyOf` / `oneOf` / `allOf`, plus unsupported schema containers such as `patternProperties`, `$defs` / `definitions`, and conditionals (`if` / `then` / `else`) so recursion does not stop early inside the tree. Only accepted JSON Schema keywords (`type`, `description`, `properties`, `required`, `additionalProperties`, `items`, `anyOf`, `oneOf`, `allOf`, `enum`, `const`, `default`, `nullable`, `title`) are kept in the final payload — everything else (e.g. `format`, `$schema`, `$id`, `$ref`, `examples`, `pattern`, `minLength`, `maxLength`, `contentEncoding`, `contentMediaType`, `patternProperties`, `$defs`, `definitions`, `if`, `then`, `else`, etc.) is silently stripped. At every object node with `properties`, `required` is expanded to include every property key. Boolean `additionalProperties` is forced to `false` for strict Codex compatibility, while schema-valued `additionalProperties` is preserved and normalized recursively.
+**Tool Schema Normalization:** Tool parameter schemas are normalized bottom-up at **every schema node** before forwarding to the Codex API. Claudex first recurses through nested `properties`, schema-valued `additionalProperties`, `items`, `anyOf`, rejected combinators such as `oneOf` / `allOf`, plus unsupported schema containers such as `patternProperties`, `$defs` / `definitions`, `not`, and conditionals (`if` / `then` / `else`), then repairs the current node. Missing `type` is inferred as `object` when `properties` exist, `array` when `items` exist, and `object` otherwise. At every object node with `properties`, `required` is normalized to the exact set of Codex-counted property keys: regular fields stay required, while pure record/map containers (object schemas that only expose schema-valued `additionalProperties`) and stripped empty object shells (for example, properties left behind after `oneOf` / `allOf` are removed) stay optional because Codex rejects them in `required`. `additionalProperties` is forced to `false` on every non-record object node. After normalization, only accepted JSON Schema keywords (`type`, `description`, `properties`, `required`, `additionalProperties`, `items`, `anyOf`, `enum`, `const`, `default`, `nullable`, `title`) are kept in the final payload. Unsupported fields such as `format`, `$schema`, `$id`, `$ref`, `examples`, `pattern`, `minLength`, `maxLength`, `contentEncoding`, `contentMediaType`, `patternProperties`, `$defs`, `definitions`, `if`, `then`, `else`, `oneOf`, and `allOf` are stripped before the request is sent.
 
 **Field Stripping:** Only whitelisted top-level fields are forwarded to Codex: `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`, `service_tier`, `prompt_cache_key`, and `text`. Everything else is stripped before the request is sent.
 
-**SSE Streaming:** All Codex SSE event types are handled: `response.created`, `response.output_text.delta`, `response.output_text.done`, `response.output_item.added`, `response.output_item.done`, `response.completed`, `response.failed`, `response.incomplete`, `response.reasoning_summary_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_part.added`.
+**Tool History Conversion:** Multi-turn Claude tool transcripts are converted into Codex-compatible top-level `input` items. Assistant `tool_use` blocks become standalone `function_call` items with a preserved `call_id`, and user `tool_result` blocks become standalone `function_call_output` items. Claudex intentionally omits `function_call.id` when replaying history, because Codex rejects Claude-style `call_*` IDs in that field.
+
+**SSE Streaming:** Claudex now always talks to Codex with `stream: true`, because the Codex backend rejects non-streaming requests. Anthropic streaming requests are forwarded as SSE, while Anthropic non-streaming requests are aggregated from the Codex SSE stream back into a normal JSON message. All Codex SSE event types are handled: `response.created`, `response.output_text.delta`, `response.output_text.done`, `response.output_item.added`, `response.output_item.done`, `response.completed`, `response.failed`, `response.incomplete`, `response.reasoning_summary_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_part.added`.
 
 **Authentication:** Uses the same OAuth PKCE flow as opencode/Codex CLI. Token refresh is concurrent-safe — simultaneous expired-token requests share a single refresh promise.
 

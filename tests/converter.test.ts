@@ -20,6 +20,10 @@ import {
 } from "../src/converter.js";
 import { _resetForTesting, getModels } from "../src/models.js";
 
+function asCodexMessage(item: unknown): { role: string; content: unknown } {
+  return item as { role: string; content: unknown };
+}
+
 describe("anthropicToCodex", () => {
   it("should convert a simple text request", () => {
     const req: AnthropicRequest = {
@@ -37,8 +41,9 @@ describe("anthropicToCodex", () => {
       undefined
     );
     assert.equal(result.input.length, 1);
-    assert.equal(result.input[0].role, "user");
-    assert.equal(result.input[0].content, "Hello, world!");
+    const message = asCodexMessage(result.input[0]);
+    assert.equal(message.role, "user");
+    assert.equal(message.content, "Hello, world!");
   });
 
   it("should convert system prompt to instructions", () => {
@@ -84,10 +89,13 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     assert.equal(result.input.length, 3);
-    assert.equal(result.input[0].content, "Hello");
-    assert.equal(result.input[1].role, "assistant");
-    assert.equal(result.input[1].content, "Hi there!");
-    assert.equal(result.input[2].content, "How are you?");
+    const first = asCodexMessage(result.input[0]);
+    const second = asCodexMessage(result.input[1]);
+    const third = asCodexMessage(result.input[2]);
+    assert.equal(first.content, "Hello");
+    assert.equal(second.role, "assistant");
+    assert.equal(second.content, "Hi there!");
+    assert.equal(third.content, "How are you?");
   });
 
   it("should convert tools to OpenAI format with strict schema", () => {
@@ -237,14 +245,22 @@ describe("anthropicToCodex", () => {
 
     const result = anthropicToCodex(req);
 
-    // Assistant message should have text + function call
-    assert.ok(result.input.length >= 2);
-    const assistantMsg = result.input[0];
-    assert.equal(assistantMsg.role, "assistant");
-
-    // User message with tool result
-    const toolResultMsg = result.input[1];
-    assert.equal(toolResultMsg.role, "user");
+    assert.equal(result.input.length, 3);
+    assert.deepEqual(result.input[0], {
+      role: "assistant",
+      content: "Let me check the weather.",
+    });
+    assert.deepEqual(result.input[1], {
+      type: "function_call",
+      call_id: "toolu_123",
+      name: "get_weather",
+      arguments: JSON.stringify({ location: "Tokyo" }),
+    });
+    assert.deepEqual(result.input[2], {
+      type: "function_call_output",
+      call_id: "toolu_123",
+      output: "Sunny, 25°C",
+    });
   });
 
   it("should set tool_choice and parallel_tool_calls when tools present", () => {
@@ -353,6 +369,274 @@ describe("anthropicToCodex", () => {
   });
 });
 
+const SCHEMA_MAP_KEYS = [
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+];
+
+const SCHEMA_ARRAY_KEYS = ["anyOf", "oneOf", "allOf", "prefixItems"];
+
+const SCHEMA_VALUE_KEYS = [
+  "additionalProperties",
+  "items",
+  "not",
+  "if",
+  "then",
+  "else",
+  "contains",
+  "propertyNames",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "contentSchema",
+];
+
+const REAL_TOOL_SCHEMA_FIXTURES: Record<string, Record<string, unknown>> = {
+  ExitPlanMode: {
+    properties: {
+      allowedPrompts: {
+        type: "array",
+        items: {
+          properties: {
+            tool: { enum: ["Bash"] },
+            prompt: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+  AskUserQuestion: {
+    type: "object",
+    properties: {
+      questions: {
+        type: "array",
+        items: {
+          properties: {
+            question: { type: "string" },
+            header: { type: "string" },
+            options: {
+              type: "array",
+              items: {
+                properties: {
+                  label: { type: "string" },
+                  description: { type: "string" },
+                  preview: { type: "string", format: "uri" },
+                },
+              },
+            },
+            multiSelect: { type: "boolean" },
+          },
+        },
+      },
+      answers: {
+        type: "object",
+        additionalProperties: { type: "string", format: "date-time" },
+      },
+      annotations: {
+        type: "object",
+        additionalProperties: {
+          properties: {
+            preview: { type: "string", format: "uri" },
+            notes: { type: "string" },
+          },
+        },
+      },
+      metadata: {
+        properties: {
+          source: { type: "string" },
+        },
+      },
+    },
+  },
+  WebFetch: {
+    type: "object",
+    properties: {
+      url: { type: "string", format: "uri" },
+      prompt: { type: "string" },
+    },
+  },
+  Agent: {
+    type: "object",
+    properties: {
+      description: { type: "string" },
+      prompt: { type: "string" },
+      subagent_type: { type: "string" },
+      model: { enum: ["sonnet", "opus", "haiku"] },
+      resume: { type: "string" },
+      run_in_background: { type: "boolean" },
+    },
+  },
+  Bash: {
+    type: "object",
+    properties: {
+      command: { type: "string" },
+      timeout: { type: "number" },
+      description: { type: "string" },
+      run_in_background: { type: "boolean" },
+      dangerouslyDisableSandbox: { type: "boolean" },
+      _simulatedSedEdit: {
+        type: "object",
+        properties: {
+          filePath: { type: "string" },
+          newContent: { type: "string" },
+        },
+      },
+    },
+  },
+  TaskCreate: {
+    type: "object",
+    properties: {
+      subject: { type: "string" },
+      description: { type: "string" },
+      activeForm: { type: "string" },
+      metadata: {
+        type: "object",
+        additionalProperties: {},
+      },
+    },
+    required: ["subject", "description"],
+  },
+  Read: {
+    type: "object",
+    properties: {
+      file_path: { type: "string" },
+      offset: { type: "number" },
+      limit: { type: "number" },
+      pages: { type: "string" },
+    },
+  },
+  Edit: {
+    type: "object",
+    properties: {
+      file_path: { type: "string" },
+      old_string: { type: "string" },
+      new_string: { type: "string" },
+      replace_all: { type: "boolean", default: false },
+    },
+  },
+  TodoWrite: {
+    type: "object",
+    properties: {
+      todos: {
+        type: "array",
+        items: {
+          properties: {
+            content: { type: "string" },
+            status: { enum: ["pending", "in_progress", "completed"] },
+            activeForm: { type: "string" },
+          },
+        },
+      },
+    },
+  },
+};
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function expectedRequiredKeys(
+  properties: Record<string, unknown>
+): string[] {
+  return Object.entries(properties)
+    .filter(([, schema]) => {
+      if (!isObjectRecord(schema)) {
+        return true;
+      }
+
+      return !(
+        schema.type === "object" &&
+        !isObjectRecord(schema.properties) &&
+        schema.items === undefined &&
+        isObjectRecord(schema.additionalProperties)
+      );
+    })
+    .filter(([, schema]) => {
+      if (!isObjectRecord(schema)) {
+        return true;
+      }
+
+      return !(
+        schema.type === "object" &&
+        (!isObjectRecord(schema.properties) ||
+          Object.keys(schema.properties).length === 0) &&
+        schema.items === undefined &&
+        !Array.isArray(schema.anyOf) &&
+        schema.enum === undefined &&
+        schema.const === undefined &&
+        !isObjectRecord(schema.additionalProperties)
+      );
+    })
+    .map(([key]) => key);
+}
+
+function visitSchemaNodes(
+  node: unknown,
+  visitor: (schema: Record<string, unknown>) => void
+): void {
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      visitSchemaNodes(item, visitor);
+    }
+    return;
+  }
+
+  if (!isObjectRecord(node)) {
+    return;
+  }
+
+  visitor(node);
+
+  for (const key of SCHEMA_MAP_KEYS) {
+    const value = node[key];
+    if (isObjectRecord(value)) {
+      for (const child of Object.values(value)) {
+        visitSchemaNodes(child, visitor);
+      }
+    }
+  }
+
+  for (const key of SCHEMA_ARRAY_KEYS) {
+    const value = node[key];
+    if (Array.isArray(value)) {
+      for (const child of value) {
+        visitSchemaNodes(child, visitor);
+      }
+    }
+  }
+
+  for (const key of SCHEMA_VALUE_KEYS) {
+    const value = node[key];
+    if (typeof value === "boolean") {
+      continue;
+    }
+    visitSchemaNodes(value, visitor);
+  }
+}
+
+function assertSchemaInvariants(node: unknown): void {
+  visitSchemaNodes(node, (schema) => {
+    assert.equal(schema.format, undefined);
+    assert.equal(schema.oneOf, undefined);
+    assert.equal(schema.allOf, undefined);
+
+    const properties = schema.properties;
+    if (!isObjectRecord(properties)) {
+      return;
+    }
+
+    const keys = expectedRequiredKeys(properties);
+    assert.equal(schema.additionalProperties, false);
+    assert.equal(schema.type, "object");
+    assert.deepEqual(
+      new Set((schema.required as string[]) ?? []),
+      new Set(keys)
+    );
+  });
+}
+
 describe("sanitizeToolSchema", () => {
   it("should strip format from property definitions", () => {
     const schema = {
@@ -408,7 +692,7 @@ describe("sanitizeToolSchema", () => {
     assert.equal(items.format, undefined);
   });
 
-  it("should strip format inside anyOf/oneOf/allOf", () => {
+  it("should strip format inside anyOf branches", () => {
     const schema = {
       type: "object",
       properties: {
@@ -427,6 +711,52 @@ describe("sanitizeToolSchema", () => {
     assert.equal(anyOf[0].type, "string");
     assert.equal(anyOf[1].format, undefined);
     assert.equal(anyOf[1].type, "number");
+  });
+
+  it("should strip oneOf and allOf after recursively normalizing their branches", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        choice: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                mode: { type: "string", format: "uri" },
+              },
+            },
+            { type: "string", format: "date-time" },
+          ],
+        },
+        combined: {
+          allOf: [
+            {
+              type: "object",
+              properties: {
+                a: { type: "string", format: "hostname" },
+              },
+            },
+            {
+              type: "object",
+              properties: {
+                b: { type: "number", format: "double" },
+              },
+            },
+          ],
+        },
+      },
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+
+    assert.equal(props.choice.oneOf, undefined);
+    assert.equal(props.choice.type, "object");
+    assert.equal(props.choice.additionalProperties, false);
+
+    assert.equal(props.combined.allOf, undefined);
+    assert.equal(props.combined.type, "object");
+    assert.equal(props.combined.additionalProperties, false);
   });
 
   it("should strip $schema, $id, $ref, examples, and other unsupported keywords", () => {
@@ -485,6 +815,96 @@ describe("sanitizeToolSchema", () => {
     assert.equal(innerRequired.length, 2);
   });
 
+  it("should drop required keys that are no longer present in properties", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        question: { type: "string" },
+      },
+      required: ["question", "answers"],
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+
+    assert.deepEqual(result.required, ["question"]);
+  });
+
+  it("should exclude pure record container properties from required", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        questions: {
+          type: "array",
+          items: { type: "string" },
+        },
+        answers: {
+          type: "object",
+          additionalProperties: { type: "string" },
+        },
+        metadata: {
+          type: "object",
+          properties: {
+            source: { type: "string" },
+          },
+        },
+      },
+      required: ["questions"],
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+
+    assert.deepEqual(result.required, ["questions", "metadata"]);
+  });
+
+  it("should force additionalProperties false on unknown record value schemas", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        metadata: {
+          type: "object",
+          additionalProperties: {},
+        },
+      },
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const metadata = (result.properties as Record<string, Record<string, unknown>>)
+      .metadata;
+    const metadataValue = metadata.additionalProperties as Record<string, unknown>;
+
+    assert.equal(metadata.type, "object");
+    assert.ok(isObjectRecord(metadata.additionalProperties));
+    assert.equal(metadataValue.type, "object");
+    assert.equal(metadataValue.additionalProperties, false);
+  });
+
+  it("should exclude stripped combinator shells from required", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        choice: {
+          oneOf: [{ type: "string" }, { type: "number" }],
+        },
+        combo: {
+          allOf: [
+            { type: "object", properties: { a: { type: "string" } } },
+            { type: "object", properties: { b: { type: "string" } } },
+          ],
+        },
+      },
+      required: ["choice", "combo"],
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const props = result.properties as Record<string, Record<string, unknown>>;
+
+    assert.deepEqual(result.required, []);
+    assert.equal(props.choice.type, "object");
+    assert.equal(props.choice.additionalProperties, false);
+    assert.equal(props.combo.type, "object");
+    assert.equal(props.combo.additionalProperties, false);
+  });
+
   it("should enforce additionalProperties = false at every object level", () => {
     const schema = {
       type: "object",
@@ -510,6 +930,17 @@ describe("sanitizeToolSchema", () => {
     assert.equal(sanitizeToolSchema("string"), "string");
     assert.equal(sanitizeToolSchema(42), 42);
     assert.equal(sanitizeToolSchema(true), true);
+  });
+
+  it("should normalize the real tool schema fixtures without mutating them", () => {
+    for (const [name, fixture] of Object.entries(REAL_TOOL_SCHEMA_FIXTURES)) {
+      const original = structuredClone(fixture);
+      const result = sanitizeToolSchema(fixture);
+
+      assert.ok(isObjectRecord(result), `${name} should sanitize to an object`);
+      assertSchemaInvariants(result);
+      assert.deepEqual(fixture, original, `${name} fixture should not be mutated`);
+    }
   });
 
   it("should preserve enum and const values", () => {
@@ -645,7 +1076,7 @@ describe("sanitizeToolSchema", () => {
     assert.equal(tags.type, "array");
   });
 
-  it("should infer type from enum values when type is missing", () => {
+  it("should default missing enum-only schemas to object", () => {
     const schema = {
       type: "object",
       properties: {
@@ -655,11 +1086,11 @@ describe("sanitizeToolSchema", () => {
     };
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
     const props = result.properties as Record<string, Record<string, unknown>>;
-    assert.equal(props.mode.type, "string");
-    assert.equal(props.count.type, "number");
+    assert.equal(props.mode.type, "object");
+    assert.equal(props.count.type, "object");
   });
 
-  it("should infer type from const value when type is missing", () => {
+  it("should default missing const-only schemas to object", () => {
     const schema = {
       type: "object",
       properties: {
@@ -670,9 +1101,9 @@ describe("sanitizeToolSchema", () => {
     };
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
     const props = result.properties as Record<string, Record<string, unknown>>;
-    assert.equal(props.version.type, "number");
-    assert.equal(props.name.type, "string");
-    assert.equal(props.flag.type, "boolean");
+    assert.equal(props.version.type, "object");
+    assert.equal(props.name.type, "object");
+    assert.equal(props.flag.type, "object");
   });
 
   it("should add type: object to schema node with anyOf when type is missing", () => {
@@ -757,6 +1188,120 @@ describe("sanitizeToolSchema", () => {
 });
 
 describe("anthropicToCodex tool schema sanitization (integration)", () => {
+  it("should normalize ExitPlanMode into a backend-safe object schema", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "exit plan mode" }],
+      tools: [
+        {
+          name: "ExitPlanMode",
+          description: "Exit plan mode",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.ExitPlanMode),
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters as Record<string, unknown>;
+    const allowedPrompts = (params.properties as Record<string, Record<string, unknown>>)
+      .allowedPrompts;
+    const promptItem = allowedPrompts.items as Record<string, unknown>;
+
+    assert.equal(params.type, "object");
+    assert.equal(params.additionalProperties, false);
+    assert.deepEqual(
+      new Set((params.required as string[]) ?? []),
+      new Set(["allowedPrompts"])
+    );
+    assert.equal(promptItem.type, "object");
+    assert.equal(promptItem.additionalProperties, false);
+    assert.deepEqual(
+      new Set((promptItem.required as string[]) ?? []),
+      new Set(["tool", "prompt"])
+    );
+    assertSchemaInvariants(params);
+  });
+
+  it("should normalize AskUserQuestion nested record schemas without dropping recursion", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "ask a question" }],
+      tools: [
+        {
+          name: "AskUserQuestion",
+          description: "Ask the user a question",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.AskUserQuestion),
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters as Record<string, unknown>;
+    const props = params.properties as Record<string, Record<string, unknown>>;
+    const answers = props.answers;
+    const annotations = props.annotations;
+    const annotationValue = annotations.additionalProperties as Record<string, unknown>;
+    const metadata = props.metadata;
+
+    assert.equal(params.additionalProperties, false);
+    assert.deepEqual(
+      new Set((params.required as string[]) ?? []),
+      new Set(["questions", "metadata"])
+    );
+    assert.ok(isObjectRecord(answers.additionalProperties));
+    assert.equal(
+      (answers.additionalProperties as Record<string, unknown>).format,
+      undefined
+    );
+    assert.ok(!(params.required as string[]).includes("answers"));
+    assert.ok(!(params.required as string[]).includes("annotations"));
+    assert.equal(annotationValue.type, "object");
+    assert.equal(annotationValue.additionalProperties, false);
+    assert.deepEqual(
+      new Set((annotationValue.required as string[]) ?? []),
+      new Set(["preview", "notes"])
+    );
+    assert.equal(metadata.type, "object");
+    assert.equal(metadata.additionalProperties, false);
+    assert.deepEqual(
+      new Set((metadata.required as string[]) ?? []),
+      new Set(["source"])
+    );
+    assertSchemaInvariants(params);
+  });
+
+  it("should normalize TaskCreate unknown record values for Codex", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "create a task" }],
+      tools: [
+        {
+          name: "TaskCreate",
+          description: "Create a task",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.TaskCreate),
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters as Record<string, unknown>;
+    const metadata = (params.properties as Record<string, Record<string, unknown>>)
+      .metadata;
+    const metadataValue = metadata.additionalProperties as Record<string, unknown>;
+
+    assert.deepEqual(
+      new Set((params.required as string[]) ?? []),
+      new Set(["subject", "description", "activeForm"])
+    );
+    assert.equal(metadata.type, "object");
+    assert.ok(isObjectRecord(metadata.additionalProperties));
+    assert.equal(metadataValue.type, "object");
+    assert.equal(metadataValue.additionalProperties, false);
+  });
+
   it("should strip format:uri from WebFetch-like tool", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
@@ -785,6 +1330,8 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     // required includes all keys
     assert.ok((params.required as string[]).includes("url"));
     assert.ok((params.required as string[]).includes("raw"));
+    assert.equal(params.additionalProperties, false);
+    assertSchemaInvariants(params);
   });
 
   it("should strip all unsupported keywords from complex tool schemas", () => {
@@ -837,6 +1384,47 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     const tagsProp = ((itemSchema as Record<string, Record<string, unknown>>).properties as Record<string, Record<string, unknown>>).tags;
     const tagsItems = tagsProp.items as Record<string, unknown>;
     assert.equal(tagsItems.pattern, undefined);
+    assertSchemaInvariants(params);
+  });
+
+  it("should exclude stripped combinator shells from top-level required keys", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "probe combinators" }],
+      tools: [
+        {
+          name: "SchemaProbe",
+          description: "Probe stripped combinators",
+          input_schema: {
+            type: "object",
+            properties: {
+              choice: {
+                oneOf: [{ type: "string" }, { type: "number" }],
+              },
+              combo: {
+                allOf: [
+                  {
+                    type: "object",
+                    properties: { a: { type: "string" } },
+                  },
+                  {
+                    type: "object",
+                    properties: { b: { type: "string" } },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters as Record<string, unknown>;
+
+    assert.deepEqual(params.required, []);
+    assertSchemaInvariants(params);
   });
 
   it("should preserve recursive normalization for schema-valued additionalProperties in converted tools", () => {

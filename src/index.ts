@@ -168,7 +168,7 @@ async function main(): Promise<void> {
 
 \x1b[33mConfigure Claude Code:\x1b[0m
   export ANTHROPIC_BASE_URL=http://localhost:${port}
-  export ANTHROPIC_API_KEY=placeholder
+  export ANTHROPIC_API_KEY=sk-ant-placeholder
 
 \x1b[33mThen use Claude Code normally:\x1b[0m
   claude "Help me refactor this function"

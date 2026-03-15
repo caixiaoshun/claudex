@@ -24,6 +24,15 @@ import {
 const CODEX_API_ENDPOINT =
   process.env.CODEX_API_ENDPOINT ||
   "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_API_FETCH_RETRIES = Math.max(
+  1,
+  Number.parseInt(process.env.CODEX_API_FETCH_RETRIES || "3", 10) || 3
+);
+const CODEX_API_FETCH_RETRY_DELAY_MS = Math.max(
+  0,
+  Number.parseInt(process.env.CODEX_API_FETCH_RETRY_DELAY_MS || "1000", 10) ||
+    1000
+);
 
 function readBody(req: http.IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -32,6 +41,72 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
     req.on("error", reject);
   });
+}
+
+function extractSchemaErrorToolName(errorText: string): string | null {
+  const match = errorText.match(/function '([^']+)'/);
+  return match ? match[1] : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchCodexWithRetries(
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= CODEX_API_FETCH_RETRIES; attempt += 1) {
+    try {
+      return await fetch(url, init);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= CODEX_API_FETCH_RETRIES) {
+        break;
+      }
+
+      logger.warn("Codex API fetch failed, retrying", {
+        attempt,
+        retries: CODEX_API_FETCH_RETRIES,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await sleep(CODEX_API_FETCH_RETRY_DELAY_MS * attempt);
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function logSchemaForTool(
+  toolName: string,
+  anthropicReq: AnthropicRequest,
+  codexReq: ReturnType<typeof anthropicToCodex>
+): void {
+  if (Array.isArray(anthropicReq.tools)) {
+    const incomingTool = anthropicReq.tools.find((tool) => tool.name === toolName);
+    if (incomingTool) {
+      logger.debug("Incoming tool schema for failed tool", {
+        name: incomingTool.name,
+        input_schema: incomingTool.input_schema,
+      });
+    }
+  }
+
+  if (Array.isArray(codexReq.tools)) {
+    const convertedTool = codexReq.tools.find((tool) => tool.name === toolName);
+    if (convertedTool) {
+      logger.debug("Converted tool schema for failed tool", {
+        name: convertedTool.name,
+        parameters: convertedTool.parameters,
+      });
+    }
+  }
 }
 
 /**
@@ -77,8 +152,44 @@ async function handleMessages(
     return;
   }
 
-  // Convert request format
-  const codexReq = anthropicToCodex(anthropicReq);
+  // Convert request format. Codex now requires stream=true even when the
+  // Anthropic client asked for a sync response, so the proxy always talks to
+  // Codex over SSE and aggregates back to JSON when needed.
+  const codexReq = {
+    ...anthropicToCodex(anthropicReq),
+    stream: true,
+  };
+
+  const schemaDebugTools = new Set([
+    "AskUserQuestion",
+    "ExitPlanMode",
+    "TaskCreate",
+    "TaskUpdate",
+    "Task",
+  ]);
+  if (Array.isArray(anthropicReq.tools)) {
+    const incomingTools = anthropicReq.tools
+      .filter((tool) => schemaDebugTools.has(tool.name))
+      .map((tool) => ({
+        name: tool.name,
+        input_schema: tool.input_schema,
+      }));
+    if (incomingTools.length > 0) {
+      logger.debug("Incoming tool schemas", { tools: incomingTools });
+    }
+  }
+
+  if (Array.isArray(codexReq.tools)) {
+    const convertedTools = codexReq.tools
+      .filter((tool) => schemaDebugTools.has(tool.name))
+      .map((tool) => ({
+        name: tool.name,
+        parameters: tool.parameters,
+      }));
+    if (convertedTools.length > 0) {
+      logger.debug("Converted tool schemas", { tools: convertedTools });
+    }
+  }
 
   // Build headers matching opencode's pattern
   const headers: Record<string, string> = {
@@ -94,7 +205,7 @@ async function handleMessages(
   try {
     let codexRes: Response;
     try {
-      codexRes = await fetch(CODEX_API_ENDPOINT, {
+      codexRes = await fetchCodexWithRetries(CODEX_API_ENDPOINT, {
         method: "POST",
         headers,
         body: JSON.stringify(codexReq),
@@ -113,9 +224,13 @@ async function handleMessages(
 
     if (!codexRes.ok) {
       const errorText = await codexRes.text().catch(() => "Unknown error");
+      const failedToolName = extractSchemaErrorToolName(errorText);
       logger.error(`Codex API error: ${codexRes.status}`, {
         body: errorText.slice(0, 500),
       });
+      if (failedToolName) {
+        logSchemaForTool(failedToolName, anthropicReq, codexReq);
+      }
       logger.requestLog(
         anthropicReq.model,
         estimatedTokens,
@@ -168,7 +283,7 @@ async function handleSyncResponse(
 ): Promise<void> {
   let body: Record<string, unknown>;
   try {
-    body = (await codexRes.json()) as Record<string, unknown>;
+    body = await collectCodexResponseFromSSE(codexRes);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Failed to parse Codex response", { error: msg });
@@ -297,6 +412,153 @@ function parseSSEEvent(raw: string): { event: string; data: string | null } {
   return {
     event,
     data: dataLines.length > 0 ? dataLines.join("\n") : null,
+  };
+}
+
+export async function collectCodexResponseFromSSE(
+  codexRes: Response
+): Promise<Record<string, unknown>> {
+  const reader = codexRes.body?.getReader();
+  if (!reader) {
+    return {};
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResponse: Record<string, unknown> | null = null;
+  let currentText = "";
+  const fallbackOutput: Array<Record<string, unknown>> = [];
+  let usage: Record<string, unknown> | undefined;
+  let status = "completed";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() || "";
+
+    for (const part of parts) {
+      if (!part.trim()) {
+        continue;
+      }
+
+      const { event, data } = parseSSEEvent(part);
+      if (!data) {
+        continue;
+      }
+
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(data) as Record<string, unknown>;
+      } catch {
+        logger.debug("Skipping unparseable sync SSE data", {
+          raw: data.slice(0, 100),
+        });
+        continue;
+      }
+
+      const response = isRecord(parsed.response) ? parsed.response : null;
+      if (response) {
+        finalResponse = response;
+      }
+
+      switch (event) {
+        case "response.output_text.delta":
+          if (typeof parsed.delta === "string") {
+            currentText += parsed.delta;
+          }
+          break;
+
+        case "response.output_text.done": {
+          const text =
+            typeof parsed.text === "string" ? parsed.text : currentText;
+          if (text) {
+            fallbackOutput.push({
+              type: "message",
+              content: [{ type: "output_text", text }],
+            });
+          }
+          currentText = "";
+          break;
+        }
+
+        case "response.output_item.done": {
+          const item = isRecord(parsed.item) ? parsed.item : parsed;
+          if (item.type === "function_call") {
+            fallbackOutput.push(item);
+          }
+          break;
+        }
+
+        case "response.completed":
+          if (!response && Array.isArray(parsed.output)) {
+            finalResponse = {
+              output: parsed.output,
+              usage: isRecord(parsed.usage)
+                ? parsed.usage
+                : usage ?? { input_tokens: 0, output_tokens: 0 },
+              status:
+                typeof parsed.status === "string"
+                  ? parsed.status
+                  : "completed",
+            };
+          }
+          usage = isRecord(response?.usage)
+            ? response.usage
+            : isRecord(parsed.usage)
+              ? parsed.usage
+              : usage;
+          status =
+            typeof response?.status === "string"
+              ? response.status
+              : typeof parsed.status === "string"
+                ? parsed.status
+                : "completed";
+          break;
+
+        case "response.incomplete":
+          usage = isRecord(response?.usage)
+            ? response.usage
+            : isRecord(parsed.usage)
+              ? parsed.usage
+              : usage;
+          status = "incomplete";
+          break;
+
+        case "response.failed":
+          usage = isRecord(response?.usage)
+            ? response.usage
+            : isRecord(parsed.usage)
+              ? parsed.usage
+              : usage;
+          status = "failed";
+          break;
+      }
+    }
+  }
+
+  if (finalResponse) {
+    return finalResponse;
+  }
+
+  if (currentText) {
+    fallbackOutput.push({
+      type: "message",
+      content: [{ type: "output_text", text: currentText }],
+    });
+  }
+
+  return {
+    output:
+      fallbackOutput.length > 0
+        ? fallbackOutput
+        : [{ type: "message", content: [{ type: "output_text", text: "" }] }],
+    usage: usage ?? { input_tokens: 0, output_tokens: 0 },
+    status,
   };
 }
 
