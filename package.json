@@ -1,6 +1,6 @@
 {
   "name": "@caixiaoshun/claudex",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "Bridge Claude Code to ChatGPT Codex via local proxy — use your ChatGPT subscription with Claude Code",
   "main": "dist/src/index.js",
   "bin": {
