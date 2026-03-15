@@ -78,7 +78,7 @@ export interface ExternalSource {
  * Known locations where Codex-compatible credentials may be stored.
  * 已知的存储 Codex 兼容凭证的位置。
  */
-const EXTERNAL_CANDIDATE_PATHS: Array<{
+export const EXTERNAL_CANDIDATE_PATHS: Array<{
   name: string;
   filePath: string;
   parse: (raw: string) => SessionData | null;
@@ -90,27 +90,36 @@ const EXTERNAL_CANDIDATE_PATHS: Array<{
     parse(raw) {
       try {
         const d = JSON.parse(raw) as Record<string, unknown>;
+        // Codex CLI may store tokens at the top level or nested under a "tokens" key
+        const src = (d.tokens as Record<string, unknown> | undefined) ?? d;
         // Codex CLI uses camelCase
-        const accessToken = (d.accessToken ?? d.access_token) as string | undefined;
-        const refreshToken = (d.refreshToken ?? d.refresh_token) as string | undefined;
-        if (!accessToken || !refreshToken) return null;
+        const accessToken = (src.accessToken ?? src.access_token) as string | undefined;
+        const refreshToken = (src.refreshToken ?? src.refresh_token) as string | undefined;
+        if (!accessToken || !refreshToken) {
+          logger.debug("Codex CLI auth.json: missing accessToken or refreshToken", { keys: Object.keys(d) });
+          return null;
+        }
 
-        // expiresAt may be a Unix timestamp (ms) or ISO string
+        // expiresAt may be a Unix timestamp (ms or s), ISO string, or "expires_in" (seconds from now)
         let expiresAt: number;
-        const raw_exp = d.expiresAt ?? d.expires_at;
+        const raw_exp = src.expiresAt ?? src.expires_at;
+        const raw_exp_in = src.expiresIn ?? src.expires_in;
         if (typeof raw_exp === "number") {
           // If it looks like seconds (< year 3000 in ms would be ~32503680000000)
           expiresAt = raw_exp < 1e12 ? raw_exp * 1000 : raw_exp;
         } else if (typeof raw_exp === "string") {
           expiresAt = new Date(raw_exp).getTime();
+        } else if (typeof raw_exp_in === "number") {
+          expiresAt = Date.now() + raw_exp_in * 1000;
         } else {
           // Unknown — assume 1 hour from now so the refresh path is taken
           expiresAt = Date.now() + 3_600_000;
         }
 
-        const accountId = (d.accountId ?? d.account_id) as string | undefined;
+        const accountId = (src.accountId ?? src.account_id) as string | undefined;
         return { access_token: accessToken, refresh_token: refreshToken, expires_at: expiresAt, account_id: accountId };
-      } catch {
+      } catch (err) {
+        logger.debug("Codex CLI auth.json: parse error", { error: String(err) });
         return null;
       }
     },
@@ -182,15 +191,26 @@ const EXTERNAL_CANDIDATE_PATHS: Array<{
 export function detectExternalSources(): ExternalSource[] {
   const found: ExternalSource[] = [];
   for (const candidate of EXTERNAL_CANDIDATE_PATHS) {
-    if (!fs.existsSync(candidate.filePath)) continue;
+    logger.debug(`Checking external source: ${candidate.name}`, { path: candidate.filePath });
+    if (!fs.existsSync(candidate.filePath)) {
+      logger.debug(`  File does not exist, skipping: ${candidate.filePath}`);
+      continue;
+    }
     try {
-      const raw = fs.readFileSync(candidate.filePath, "utf-8");
+      let raw = fs.readFileSync(candidate.filePath, "utf-8");
+      // Strip UTF-8 BOM that Windows editors / tools may prepend
+      if (raw.charCodeAt(0) === 0xfeff) {
+        raw = raw.slice(1);
+      }
       const session = candidate.parse(raw);
       if (session) {
+        logger.debug(`  Successfully parsed credentials from: ${candidate.name}`);
         found.push({ name: candidate.name, path: candidate.filePath, session });
+      } else {
+        logger.debug(`  File exists but parse returned null (schema mismatch?): ${candidate.filePath}`);
       }
-    } catch {
-      // Unreadable — skip
+    } catch (err) {
+      logger.debug(`  Failed to read file: ${candidate.filePath}`, { error: String(err) });
     }
   }
   return found;
