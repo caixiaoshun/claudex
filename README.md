@@ -298,8 +298,8 @@ Claude Code  →  POST /v1/messages (Anthropic format)
   Claudex Proxy (localhost:4000)
      │
      ├─ Strip Anthropic-specific fields (betas, metadata, thinking, etc.)
-     ├─ Sanitize tool schemas: whitelist-filter JSON Schema keywords, strip unsupported ones
-     ├─ Convert tools: enforce required=all property keys, strict=true
+     ├─ Normalize tool schemas recursively at every nesting level
+     ├─ Convert tools: enforce required=all property keys, preserve schema-valued additionalProperties, strict=true
      ├─ Map model: opus→max, sonnet→balanced, haiku→mini
      ├─ Build Codex request: model, instructions, input, tools, store=false
      │
@@ -315,9 +315,9 @@ Claude Code  →  POST /v1/messages (Anthropic format)
 
 ### Key Implementation Details
 
-**Tool Schema Sanitization:** Tool parameter schemas are recursively sanitized using a **whitelist filter** before forwarding to the Codex API. Only accepted JSON Schema keywords (`type`, `description`, `properties`, `required`, `additionalProperties`, `items`, `anyOf`, `oneOf`, `allOf`, `enum`, `const`, `default`, `nullable`, `title`) are kept — everything else (e.g., `format`, `$schema`, `$id`, `$ref`, `examples`, `pattern`, `minLength`, `maxLength`, `contentEncoding`, `contentMediaType`, etc.) is silently stripped. This prevents the entire class of "Invalid schema" 400 errors. Additionally, `required` is enforced to include every key in `properties` and `additionalProperties` is set to `false` at every nesting level.
+**Tool Schema Normalization:** Tool parameter schemas are recursively normalized at **every schema node** before forwarding to the Codex API. Claudex walks nested `properties`, schema-valued `additionalProperties`, `items`, `anyOf` / `oneOf` / `allOf`, `patternProperties`, `$defs` / `definitions`, conditionals (`if` / `then` / `else`), and related schema containers. Only accepted JSON Schema keywords (`type`, `description`, `properties`, `required`, `additionalProperties`, `items`, `anyOf`, `oneOf`, `allOf`, `enum`, `const`, `default`, `nullable`, `title`) are kept — everything else (e.g. `format`, `$schema`, `$id`, `$ref`, `examples`, `pattern`, `minLength`, `maxLength`, `contentEncoding`, `contentMediaType`, etc.) is silently stripped. At every object node with `properties`, `required` is expanded to include every property key. Boolean `additionalProperties` is forced to `false` for strict Codex compatibility, while schema-valued `additionalProperties` is preserved and normalized recursively.
 
-**Field Stripping:** Only whitelisted fields are forwarded to Codex: `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`. Everything else is stripped.
+**Field Stripping:** Only whitelisted top-level fields are forwarded to Codex: `model`, `instructions`, `input`, `tools`, `tool_choice`, `parallel_tool_calls`, `reasoning`, `store`, `stream`, `include`, `service_tier`, `prompt_cache_key`, and `text`. Everything else is stripped before the request is sent.
 
 **SSE Streaming:** All Codex SSE event types are handled: `response.created`, `response.output_text.delta`, `response.output_text.done`, `response.output_item.added`, `response.output_item.done`, `response.completed`, `response.failed`, `response.incomplete`, `response.reasoning_summary_text.delta`, `response.reasoning_text.delta`, `response.reasoning_summary_part.added`.
 

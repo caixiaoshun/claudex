@@ -113,12 +113,7 @@ export interface CodexTool {
   name: string;
   description: string;
   strict: true;
-  parameters: {
-    type: "object";
-    properties: Record<string, unknown>;
-    required: string[];
-    additionalProperties: false;
-  };
+  parameters: Record<string, unknown>;
 }
 
 export interface CodexReasoning {
@@ -142,6 +137,9 @@ export interface CodexRequest {
   store: false;
   stream: boolean;
   include: string[];
+  service_tier?: string;
+  prompt_cache_key?: string;
+  text?: Record<string, unknown>;
 }
 
 // ===================================================================
@@ -247,56 +245,160 @@ const ALLOWED_SCHEMA_KEYWORDS = new Set<string>([
   "title",
 ]);
 
+const ALLOWED_REQUEST_FIELDS = new Set<string>([
+  "model",
+  "instructions",
+  "input",
+  "tools",
+  "tool_choice",
+  "parallel_tool_calls",
+  "reasoning",
+  "store",
+  "stream",
+  "include",
+  "service_tier",
+  "prompt_cache_key",
+  "text",
+]);
+
+const SCHEMA_MAP_KEYWORDS = new Set<string>([
+  "properties",
+  "patternProperties",
+  "$defs",
+  "definitions",
+  "dependentSchemas",
+]);
+
+const SCHEMA_ARRAY_KEYWORDS = new Set<string>([
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "prefixItems",
+]);
+
+const SCHEMA_KEYWORDS = new Set<string>([
+  "additionalProperties",
+  "items",
+  "not",
+  "if",
+  "then",
+  "else",
+  "contains",
+  "propertyNames",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "contentSchema",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeRequiredKeys(
+  required: unknown,
+  propertyKeys: string[]
+): string[] {
+  const merged: string[] = [];
+  if (Array.isArray(required)) {
+    for (const entry of required) {
+      if (typeof entry === "string" && !merged.includes(entry)) {
+        merged.push(entry);
+      }
+    }
+  }
+  for (const key of propertyKeys) {
+    if (!merged.includes(key)) {
+      merged.push(key);
+    }
+  }
+  return merged;
+}
+
+function normalizeSchemaMap(
+  value: unknown
+): Record<string, unknown> | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const normalized: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    normalized[key] = normalizeSchema(child);
+  }
+  return normalized;
+}
+
+function normalizeNestedSchemaValue(key: string, value: unknown): unknown {
+  if (SCHEMA_MAP_KEYWORDS.has(key)) {
+    return normalizeSchemaMap(value);
+  }
+
+  if (SCHEMA_ARRAY_KEYWORDS.has(key)) {
+    return Array.isArray(value) ? value.map((item) => normalizeSchema(item)) : value;
+  }
+
+  if (SCHEMA_KEYWORDS.has(key)) {
+    if (Array.isArray(value)) {
+      return value.map((item) => normalizeSchema(item));
+    }
+    return isRecord(value) ? normalizeSchema(value) : value;
+  }
+
+  return value;
+}
+
 /**
- * Recursively sanitize a JSON Schema node:
- *  1. Keep only whitelisted keywords (strip `format`, `$schema`, `$id`,
- *     `$ref`, `examples`, `contentEncoding`, `contentMediaType`, …).
- *  2. Recurse into `properties`, `items`, `anyOf`, `oneOf`, `allOf`.
- *  3. At every object-level node that has `properties`, enforce
- *     `required = Object.keys(properties)` and
- *     `additionalProperties = false`.
+ * Recursively normalize a JSON Schema node:
+ *  1. Keep only whitelisted keywords.
+ *  2. Recurse into nested schema-bearing keywords at every depth.
+ *  3. At every node with `properties`, ensure `required` includes every
+ *     property key, while preserving schema-valued `additionalProperties`.
+ *  4. Never mutate the input.
  */
-export function sanitizeToolSchema(
-  node: unknown,
-): Record<string, unknown> | unknown {
+export function normalizeSchema(node: unknown): unknown {
   if (node === null || node === undefined || typeof node !== "object") {
     return node;
   }
   if (Array.isArray(node)) {
-    return node.map((item) => sanitizeToolSchema(item));
+    return node.map((item) => normalizeSchema(item));
   }
 
-  const src = node as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
+  const source = node as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {};
 
-  for (const key of Object.keys(src)) {
-    if (!ALLOWED_SCHEMA_KEYWORDS.has(key)) continue; // strip unknown keywords
-    const value = src[key];
-
-    if (key === "properties" && value && typeof value === "object" && !Array.isArray(value)) {
-      const props = value as Record<string, unknown>;
-      const sanitized: Record<string, unknown> = {};
-      for (const propName of Object.keys(props)) {
-        sanitized[propName] = sanitizeToolSchema(props[propName]);
-      }
-      out.properties = sanitized;
-    } else if (key === "items" && value && typeof value === "object") {
-      out.items = sanitizeToolSchema(value);
-    } else if ((key === "anyOf" || key === "oneOf" || key === "allOf") && Array.isArray(value)) {
-      out[key] = value.map((v) => sanitizeToolSchema(v));
-    } else {
-      out[key] = value;
+  for (const [key, rawValue] of Object.entries(source)) {
+    const value = normalizeNestedSchemaValue(key, rawValue);
+    if (!ALLOWED_SCHEMA_KEYWORDS.has(key)) {
+      continue;
+    }
+    if (value !== undefined) {
+      normalized[key] = value;
     }
   }
 
-  // Enforce required = all property keys, additionalProperties = false
-  if (out.properties && typeof out.properties === "object") {
-    const allKeys = Object.keys(out.properties as Record<string, unknown>);
-    out.required = allKeys;
-    out.additionalProperties = false;
+  const normalizedProperties = normalized.properties;
+  if (isRecord(normalizedProperties)) {
+    const propertyKeys = Object.keys(normalizedProperties);
+    normalized.required = mergeRequiredKeys(normalized.required, propertyKeys);
+
+    if (!isRecord(normalized.additionalProperties)) {
+      normalized.additionalProperties = false;
+    }
   }
 
-  return out;
+  return normalized;
+}
+
+export const sanitizeToolSchema = normalizeSchema;
+
+function normalizeCodexRequestBody(req: CodexRequest): CodexRequest {
+  const normalized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(req)) {
+    if (ALLOWED_REQUEST_FIELDS.has(key) && value !== undefined) {
+      normalized[key] = value;
+    }
+  }
+  return normalized as unknown as CodexRequest;
 }
 
 /**
@@ -310,23 +412,30 @@ export function sanitizeToolSchema(
  */
 function convertTool(tool: AnthropicTool): CodexTool {
   const rawSchema = tool.input_schema || {};
-  const sanitized = sanitizeToolSchema(rawSchema) as Record<string, unknown>;
+  const normalizedSchema = normalizeSchema(rawSchema);
+  const parameters = isRecord(normalizedSchema)
+    ? { ...normalizedSchema }
+    : {};
 
-  // Ensure top-level properties exist
-  const properties = (sanitized.properties as Record<string, unknown>) || {};
-  const allKeys = Object.keys(properties);
+  if (!isRecord(parameters.properties)) {
+    parameters.properties = {};
+  }
+
+  parameters.type = "object";
+  parameters.required = mergeRequiredKeys(
+    parameters.required,
+    Object.keys(parameters.properties as Record<string, unknown>)
+  );
+  if (!isRecord(parameters.additionalProperties)) {
+    parameters.additionalProperties = false;
+  }
 
   return {
     type: "function",
     name: tool.name,
     description: tool.description || "",
     strict: true,
-    parameters: {
-      type: "object",
-      properties,
-      required: allKeys,
-      additionalProperties: false,
-    },
+    parameters,
   };
 }
 
@@ -513,7 +622,7 @@ export function anthropicToCodex(req: AnthropicRequest): CodexRequest {
     result.parallel_tool_calls = true;
   }
 
-  return result;
+  return normalizeCodexRequestBody(result);
 }
 
 // ===================================================================
