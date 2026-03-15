@@ -272,9 +272,7 @@ export function startPeriodicRefresh(
     }
   }, intervalMs);
   // Don't block process shutdown
-  if (refreshTimer && typeof refreshTimer === "object" && "unref" in refreshTimer) {
-    refreshTimer.unref();
-  }
+  refreshTimer.unref();
 }
 
 /**
