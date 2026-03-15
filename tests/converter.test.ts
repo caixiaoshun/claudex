@@ -146,7 +146,7 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     // All keys from properties must be in required
-    const required = result.tools![0].parameters.required;
+    const required = result.tools![0].parameters.required as string[];
     assert.ok(required.includes("a"));
     assert.ok(required.includes("b"));
     assert.ok(required.includes("c"));
@@ -578,6 +578,87 @@ describe("sanitizeToolSchema", () => {
     assert.equal(props.count.format, undefined); // format still stripped
     assert.equal(props.flag.default, true);
   });
+
+  it("should recurse into schema-valued additionalProperties", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        annotations: {
+          type: "object",
+          additionalProperties: {
+            type: "object",
+            properties: {
+              preview: { type: "string", format: "uri" },
+              score: { type: "number", minimum: 0 },
+            },
+            required: [],
+          },
+        },
+      },
+    };
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const annotations = (result.properties as Record<string, Record<string, unknown>>)
+      .annotations;
+    const nested = annotations.additionalProperties as Record<string, unknown>;
+    const nestedProps = nested.properties as Record<string, Record<string, unknown>>;
+
+    assert.equal(nestedProps.preview.format, undefined);
+    assert.equal((nestedProps.score as Record<string, unknown>).minimum, undefined);
+    assert.deepEqual(nested.required, ["preview", "score"]);
+  });
+
+  it("should strip unsupported recursive schema containers without mutating the input", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        config: {
+          type: "object",
+          patternProperties: {
+            ".*": {
+              type: "object",
+              properties: {
+                enabled: { type: "boolean", readOnly: true },
+              },
+            },
+          },
+          definitions: {
+            branch: {
+              type: "object",
+              properties: {
+                name: { type: "string", examples: ["main"] },
+              },
+            },
+          },
+          if: {
+            properties: {
+              mode: { const: "advanced" },
+            },
+          },
+          then: {
+            properties: {
+              threshold: { type: "integer", minimum: 1 },
+            },
+          },
+          else: {
+            properties: {
+              threshold: { type: "integer", maximum: 0 },
+            },
+          },
+        },
+      },
+    };
+    const original = structuredClone(schema);
+
+    const result = sanitizeToolSchema(schema) as Record<string, unknown>;
+    const config = (result.properties as Record<string, Record<string, unknown>>).config;
+    assert.equal(config.patternProperties, undefined);
+    assert.equal(config.definitions, undefined);
+    assert.equal(config.if, undefined);
+    assert.equal(config.then, undefined);
+    assert.equal(config.else, undefined);
+    assert.deepEqual(schema, original);
+  });
 });
 
 describe("anthropicToCodex tool schema sanitization (integration)", () => {
@@ -607,8 +688,8 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     assert.equal(url.type, "string");
     assert.equal(url.format, undefined);
     // required includes all keys
-    assert.ok(params.required.includes("url"));
-    assert.ok(params.required.includes("raw"));
+    assert.ok((params.required as string[]).includes("url"));
+    assert.ok((params.required as string[]).includes("raw"));
   });
 
   it("should strip all unsupported keywords from complex tool schemas", () => {
@@ -661,6 +742,45 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     const tagsProp = ((itemSchema as Record<string, Record<string, unknown>>).properties as Record<string, Record<string, unknown>>).tags;
     const tagsItems = tagsProp.items as Record<string, unknown>;
     assert.equal(tagsItems.pattern, undefined);
+  });
+
+  it("should preserve recursive normalization for schema-valued additionalProperties in converted tools", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "test" }],
+      tools: [
+        {
+          name: "AskUserQuestion",
+          description: "Ask the user a question",
+          input_schema: {
+            type: "object",
+            properties: {
+              annotations: {
+                type: "object",
+                additionalProperties: {
+                  type: "object",
+                  properties: {
+                    preview: { type: "string", format: "uri" },
+                    label: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters;
+    const annotations = (params.properties as Record<string, Record<string, unknown>>)
+      .annotations;
+    const nested = annotations.additionalProperties as Record<string, unknown>;
+    const nestedProps = nested.properties as Record<string, Record<string, unknown>>;
+
+    assert.equal(nestedProps.preview.format, undefined);
+    assert.deepEqual(nested.required, ["preview", "label"]);
   });
 });
 
