@@ -302,7 +302,7 @@ function buildAuthorizeUrl(
     id_token_add_organizations: "true",
     codex_cli_simplified_flow: "true",
     state,
-    originator: "claudex",
+    originator: "codex-cli",
   });
   return `${ISSUER}/oauth/authorize?${params.toString()}`;
 }
