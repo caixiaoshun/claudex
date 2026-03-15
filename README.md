@@ -100,6 +100,12 @@ claudex --reuse-codex
 claudex
 ```
 
+You can optionally specify a model and reasoning level:
+
+```bash
+claudex --model gpt-5.1-codex-max --reasoning high
+```
+
 Your browser will open for ChatGPT authorization. Log in and approve access — the token is cached for future runs.
 
 ---
@@ -224,6 +230,8 @@ Claudex picks the first non-expired source automatically. If the access token ha
 | Option | Description | Default |
 |---|---|---|
 | `-p, --port <port>` | Port for the proxy server | `4000` |
+| `--model <model>` | Codex model to use (e.g. `gpt-5.3-codex`) | auto-mapped |
+| `--reasoning <low\|medium\|high>` | Reasoning intensity level | auto |
 | `--reuse-codex` | Import credentials from an existing Codex / opencode installation | off |
 | `--list-sources` | List all detected external credential sources and exit | — |
 | `--debug` | Enable verbose debug logging | off |
@@ -234,21 +242,81 @@ Claudex picks the first non-expired source automatically. If the access token ha
 
 | Variable | Description | Default |
 |---|---|---|
-| `CODEX_MODEL` | Codex model to use | `gpt-5.3-codex` |
+| `CODEX_MODEL` | Codex model to use | auto-mapped from Anthropic model name |
+| `CODEX_REASONING` | Reasoning intensity: `low`, `medium`, or `high` | auto |
 | `CODEX_API_ENDPOINT` | Override the Codex API endpoint | `https://chatgpt.com/backend-api/codex/responses` |
 | `ANTHROPIC_BASE_URL` | Set on the Claude Code side to point to this proxy | `http://localhost:4000` |
 | `ANTHROPIC_API_KEY` | Set on the Claude Code side (any `sk-ant-` prefixed value works) | — |
 
 ### Available Codex Models
 
-| Model | Description |
+| Model | Tier | Description |
+|---|---|---|
+| `gpt-5.3-codex` | Mid | Default, best balance of speed and quality |
+| `gpt-5.2-codex` | Mid | Previous generation Codex model |
+| `gpt-5.1-codex` | Mid | GPT-5.1 based Codex model |
+| `gpt-5.1-codex-max` | High | Highest capability Codex model with maximum reasoning |
+| `gpt-5.1-codex-mini` | Fast | Lightweight fast Codex model |
+| `gpt-5.2` | Mid | General GPT-5.2 model |
+| `gpt-5.4` | High | Latest GPT-5.4 model |
+
+When no model is explicitly configured, Claudex automatically maps Anthropic model names:
+- `claude-*-opus-*` → `gpt-5.1-codex-max` (highest capability)
+- `claude-*-sonnet-*` → `gpt-5.3-codex` (balanced)
+- `claude-*-haiku-*` → `gpt-5.1-codex-mini` (fastest)
+
+---
+
+## 🧠 Model Selection & Reasoning
+
+Claudex supports multiple ways to select a Codex model and control reasoning intensity.
+
+### At startup (CLI flags)
+
+```bash
+claudex --model gpt-5.3-codex --reasoning high
+```
+
+### Via environment variables
+
+```bash
+CODEX_MODEL=gpt-5.3-codex CODEX_REASONING=high claudex
+```
+
+### At runtime (API endpoint)
+
+Update the model and reasoning level without restarting the proxy:
+
+```bash
+curl -X POST http://localhost:4000/claudex/config \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-5.1-codex-max", "reasoning": "high"}'
+```
+
+### Via Claude Code's `/model` command
+
+Use the `claudex:` prefix convention to switch models from within Claude Code:
+
+```
+/model claudex:gpt-5.3-codex:high
+/model claudex:gpt-5.1-codex-max
+/model claudex:gpt-5.1-codex-mini:low
+```
+
+Format: `claudex:<codex-model-name>:<reasoning-level>`
+
+The reasoning level is optional. Valid values: `low`, `medium`, `high`.
+
+### Reasoning intensity
+
+When Claudex detects that Claude Code sends Anthropic's `thinking` / extended thinking configuration, it automatically maps it to a Codex reasoning level:
+
+| Anthropic thinking budget | Codex reasoning |
 |---|---|
-| `gpt-5.3-codex` | Default, best balance of speed and quality |
-| `gpt-5.1-codex` | Stable Codex model |
-| `gpt-5.1-codex-mini` | Faster, lighter variant |
-| `gpt-5.1-codex-max` | Maximum capability |
-| `gpt-5.2-codex` | GPT-5.2 based Codex |
-| `gpt-5.4` | Latest model |
+| `budget_tokens >= 10000` | `high` |
+| `budget_tokens >= 5000` | `medium` |
+| `budget_tokens < 5000` | `low` |
+| thinking enabled, no budget | `medium` |
 
 ---
 
@@ -286,22 +354,58 @@ Auth Flow — Reuse (--reuse-codex):
 
 **Request Mapping:**
 
-| Anthropic | → | OpenAI Responses API |
-|---|---|---|
-| `messages[]` | → | `input[]` |
-| `system` | → | `instructions` |
-| `max_tokens` | → | `max_output_tokens` |
-| `tools[].input_schema` | → | `tools[].function.parameters` |
-| `stream: true` | → | `stream: true` |
+| Anthropic | → | OpenAI Responses API | Notes |
+|---|---|---|---|
+| `messages[]` | → | `input[]` | Role and content converted |
+| `system` (string or array) | → | `instructions` | Array entries joined with newline |
+| `tools[].input_schema` | → | `tools[].function.parameters` | Wrapped in `type: "function"` |
+| `stream: true` | → | `stream: true` | Direct passthrough |
+| — | → | `store: false` | Always set (required by Codex) |
+| — | → | `tool_choice: "auto"` | Set when tools are present |
+| — | → | `parallel_tool_calls: true` | Set when tools are present |
+| `thinking.budget_tokens` | → | `reasoning.effort` | Mapped to low/medium/high |
+
+**Fields stripped (not supported by Codex Responses API):**
+
+`max_tokens`, `temperature`, `top_p`, `stop_sequences`, `metadata`, `betas`, `thinking`, `stream_options`
 
 **Streaming Event Mapping:**
 
 | Codex Event | → | Anthropic Event |
 |---|---|---|
+| `response.created` | → | *(acknowledged, no output)* |
 | `response.output_text.delta` | → | `content_block_delta` (text_delta) |
 | `response.output_text.done` | → | `content_block_stop` |
 | `response.output_item.done` | → | `content_block_start/stop` (tool_use) |
+| `response.output_item.added` | → | *(acknowledged, no output)* |
 | `response.completed` | → | `message_delta` + `message_stop` |
+| `response.failed` | → | `error` + `message_stop` |
+| `response.incomplete` | → | `message_delta` (stop_reason: max_tokens) + `message_stop` |
+| `response.reasoning_summary_text.delta` | → | *(acknowledged, no output)* |
+| `response.reasoning_text.delta` | → | *(acknowledged, no output)* |
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/v1/messages` | Main proxy route (Anthropic Messages API) |
+| `GET` | `/claudex/models` | List available Codex models with descriptions |
+| `POST` | `/claudex/config` | Update runtime model/reasoning configuration |
+| `GET` | `/health` | Health check |
+
+**Example: List models**
+
+```bash
+curl http://localhost:4000/claudex/models
+```
+
+**Example: Update runtime config**
+
+```bash
+curl -X POST http://localhost:4000/claudex/config \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-5.3-codex", "reasoning": "high"}'
+```
 
 ---
 
@@ -310,14 +414,15 @@ Auth Flow — Reuse (--reuse-codex):
 ```
 claudex/
 ├── src/
-│   ├── index.ts        # CLI entry point, argument parsing, --reuse-codex / --list-sources
-│   ├── server.ts       # HTTP proxy server (POST /v1/messages)
+│   ├── index.ts        # CLI entry point, argument parsing, --model / --reasoning / --reuse-codex
+│   ├── server.ts       # HTTP proxy server (POST /v1/messages, GET /claudex/models, POST /claudex/config)
 │   ├── oauth.ts        # ChatGPT OAuth (PKCE flow + token refresh)
 │   ├── token.ts        # Session persistence + external credential detection
-│   ├── converter.ts    # Bidirectional format converter + SSE stream converter
+│   ├── converter.ts    # Bidirectional format converter + SSE stream converter + model mapping
 │   └── logger.ts       # Structured logging with colors
 ├── tests/
-│   └── converter.test.ts   # Unit tests for format conversion
+│   ├── converter.test.ts   # Unit tests for format conversion, model mapping, streaming
+│   └── token.test.ts       # Unit tests for credential parsing
 ├── package.json
 ├── tsconfig.json
 └── README.md
