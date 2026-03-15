@@ -7,6 +7,12 @@
  */
 
 import * as crypto from "node:crypto";
+import {
+  getModels,
+  getDefaultModel,
+  mapModelByTier,
+  type ModelEntry,
+} from "./models.js";
 
 // ---------- Anthropic Types ----------
 
@@ -115,11 +121,10 @@ interface OpenAIContentPart {
 
 interface OpenAITool {
   type: "function";
-  function: {
-    name: string;
-    description?: string;
-    parameters: Record<string, unknown>;
-  };
+  name: string;
+  description?: string;
+  strict: boolean;
+  parameters: Record<string, unknown>;
 }
 
 export interface CodexReasoning {
@@ -142,60 +147,46 @@ interface OpenAIResponsesRequest {
 
 // ---------- Model Mapping ----------
 
-const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
-
 /**
- * Available Codex models — sourced from the openai/codex and opencode repositories.
+ * Available Codex models — dynamically fetched from the Codex API at startup.
+ * Falls back to a hardcoded list if the API is unreachable.
+ *
+ * Use getModels() from models.ts for the live list; this getter is for
+ * backward compatibility and external consumers.
  */
-export const CODEX_MODELS: Record<
-  string,
-  { name: string; description: string; tier: "high" | "mid" | "fast" }
-> = {
-  "gpt-5.3-codex": {
-    name: "GPT-5.3 Codex",
-    description: "Default balanced model for coding tasks",
-    tier: "mid",
-  },
-  "gpt-5.2-codex": {
-    name: "GPT-5.2 Codex",
-    description: "Previous generation Codex model",
-    tier: "mid",
-  },
-  "gpt-5.1-codex": {
-    name: "GPT-5.1 Codex",
-    description: "GPT-5.1 based Codex model",
-    tier: "mid",
-  },
-  "gpt-5.1-codex-max": {
-    name: "GPT-5.1 Codex Max",
-    description: "Highest capability Codex model with maximum reasoning",
-    tier: "high",
-  },
-  "gpt-5.1-codex-mini": {
-    name: "GPT-5.1 Codex Mini",
-    description: "Lightweight fast Codex model",
-    tier: "fast",
-  },
-  "gpt-5.2": {
-    name: "GPT-5.2",
-    description: "General GPT-5.2 model",
-    tier: "mid",
-  },
-  "gpt-5.4": {
-    name: "GPT-5.4",
-    description: "Latest GPT-5.4 model",
-    tier: "high",
-  },
-};
+export function getCODEX_MODELS(): Record<string, ModelEntry> {
+  return getModels();
+}
 
-/**
- * Map from Anthropic model family patterns to Codex models.
- */
-const ANTHROPIC_TO_CODEX_MAP: Array<{ pattern: RegExp; codexModel: string }> = [
-  { pattern: /opus/i, codexModel: "gpt-5.1-codex-max" },
-  { pattern: /sonnet/i, codexModel: "gpt-5.3-codex" },
-  { pattern: /haiku/i, codexModel: "gpt-5.1-codex-mini" },
-];
+// Legacy alias — kept for backward compatibility with existing code that
+// imports CODEX_MODELS. Returns the live (cached) model list.
+export const CODEX_MODELS = new Proxy(
+  {} as Record<string, ModelEntry>,
+  {
+    get(_target, prop, _receiver) {
+      const models = getModels();
+      if (typeof prop === "string") return models[prop];
+      return undefined;
+    },
+    ownKeys() {
+      return Object.keys(getModels());
+    },
+    getOwnPropertyDescriptor(_target, prop) {
+      const models = getModels();
+      if (typeof prop === "string" && prop in models) {
+        return {
+          configurable: true,
+          enumerable: true,
+          value: models[prop],
+        };
+      }
+      return undefined;
+    },
+    has(_target, prop) {
+      return typeof prop === "string" && prop in getModels();
+    },
+  }
+);
 
 /**
  * Runtime proxy configuration — can be updated via POST /claudex/config.
@@ -230,7 +221,7 @@ export function parseClaudexModelString(
 
 /**
  * Map an Anthropic model name to a Codex model name.
- * Priority: claudex: convention > runtime config > env var > pattern match > default.
+ * Priority: claudex: convention > runtime config > env var > dynamic tier match > default.
  */
 export function mapModel(anthropicModel: string): string {
   // 1. Check for claudex: convention
@@ -244,13 +235,12 @@ export function mapModel(anthropicModel: string): string {
   const envModel = process.env.CODEX_MODEL;
   if (envModel) return envModel;
 
-  // 4. Pattern match against Anthropic model families
-  for (const { pattern, codexModel } of ANTHROPIC_TO_CODEX_MAP) {
-    if (pattern.test(anthropicModel)) return codexModel;
-  }
+  // 4. Dynamic tier match from live model list
+  const tierMatch = mapModelByTier(anthropicModel);
+  if (tierMatch) return tierMatch;
 
-  // 5. Default
-  return DEFAULT_CODEX_MODEL;
+  // 5. Default (from live model list)
+  return getDefaultModel();
 }
 
 /**
@@ -323,11 +313,10 @@ export function anthropicToCodex(req: AnthropicRequest): OpenAIResponsesRequest 
   if (req.tools && req.tools.length > 0) {
     tools = req.tools.map((t) => ({
       type: "function" as const,
-      function: {
-        name: t.name,
-        description: t.description,
-        parameters: t.input_schema,
-      },
+      name: t.name,
+      description: t.description,
+      strict: true,
+      parameters: t.input_schema,
     }));
   }
 

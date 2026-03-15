@@ -16,6 +16,12 @@ import {
   proxyConfig,
   type AnthropicRequest,
 } from "./converter.js";
+import {
+  getModels,
+  getLastFetchTime,
+  getTierMapping,
+  refreshModels,
+} from "./models.js";
 
 const CODEX_API_ENDPOINT =
   process.env.CODEX_API_ENDPOINT ||
@@ -306,8 +312,52 @@ export function startServer(port: number): http.Server {
 
     // Claudex: list available Codex models
     if (url.pathname === "/claudex/models" && req.method === "GET") {
+      const models = getModels();
+      const tierMapping = getTierMapping();
+      const lastFetch = getLastFetchTime();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ models: CODEX_MODELS }));
+      res.end(
+        JSON.stringify({
+          models,
+          tier_mapping: tierMapping,
+          last_fetched: lastFetch
+            ? new Date(lastFetch).toISOString()
+            : null,
+        })
+      );
+      return;
+    }
+
+    // Claudex: refresh model list at runtime
+    if (url.pathname === "/claudex/models/refresh" && req.method === "POST") {
+      try {
+        const session = await oauth.getValidSession();
+        const success = await refreshModels(
+          session.access_token,
+          session.account_id
+        );
+        const models = getModels();
+        const tierMapping = getTierMapping();
+        res.writeHead(success ? 200 : 503, {
+          "Content-Type": "application/json",
+        });
+        res.end(
+          JSON.stringify({
+            success,
+            models,
+            tier_mapping: tierMapping,
+            last_fetched: new Date(getLastFetchTime()).toISOString(),
+          })
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify(
+            buildErrorResponse(500, `Model refresh failed: ${msg}`)
+          )
+        );
+      }
       return;
     }
 
@@ -354,6 +404,7 @@ export function startServer(port: number): http.Server {
     logger.info(`Claudex proxy server listening on http://localhost:${port}`);
     logger.info("Route: POST /v1/messages (Anthropic Messages API)");
     logger.info("Route: GET  /claudex/models");
+    logger.info("Route: POST /claudex/models/refresh");
     logger.info("Route: POST /claudex/config");
     logger.info("Health: GET /health");
   });

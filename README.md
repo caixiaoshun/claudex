@@ -35,7 +35,7 @@ It works by intercepting Claude Code's API requests, translating them from Anthr
 - ♻️ **Reuse Existing Credentials** — If you already use Codex CLI or opencode, import their session with one flag — no browser login needed
 - 💾 **Token Persistence** — Sessions cached locally at `~/.codex-proxy/session.json` with auto-refresh
 - 🌊 **SSE Streaming** — Full streaming support, converting Codex events to Anthropic `text_delta` format in real-time
-- 🛠️ **Tool/Function Calling** — Best-effort conversion of Anthropic tool definitions to OpenAI function calling format
+- 🛠️ **Tool/Function Calling** — Best-effort conversion of Anthropic tool definitions to OpenAI Responses API function tool format
 - 📊 **Request Logging** — Every request logged with `[model] [~token estimate] [status]`
 - ⚡ **Zero Dependencies** — Built entirely on Node.js standard library (`node:http`, `node:crypto`, `node:fs`)
 - 🎯 **Drop-in Compatible** — Just set `ANTHROPIC_BASE_URL` and use Claude Code normally
@@ -234,6 +234,7 @@ Claudex picks the first non-expired source automatically. If the access token ha
 | `--reasoning <level>` | Reasoning intensity level (`low`, `medium`, or `high`) | auto |
 | `--reuse-codex` | Import credentials from an existing Codex / opencode installation | off |
 | `--list-sources` | List all detected external credential sources and exit | — |
+| `--refresh-models` | Refresh the model list from the Codex API and display available models, then exit | — |
 | `--debug` | Enable verbose debug logging | off |
 | `-h, --help` | Show help message | — |
 | `-v, --version` | Show version | — |
@@ -245,25 +246,45 @@ Claudex picks the first non-expired source automatically. If the access token ha
 | `CODEX_MODEL` | Codex model to use | auto-mapped from Anthropic model name |
 | `CODEX_REASONING` | Reasoning intensity: `low`, `medium`, or `high` | auto |
 | `CODEX_API_ENDPOINT` | Override the Codex API endpoint | `https://chatgpt.com/backend-api/codex/responses` |
+| `CODEX_MODEL_REFRESH_INTERVAL` | How often to re-fetch the model list (in milliseconds) | `3600000` (1 hour) |
 | `ANTHROPIC_BASE_URL` | Set on the Claude Code side to point to this proxy | `http://localhost:4000` |
 | `ANTHROPIC_API_KEY` | Set on the Claude Code side (any `sk-ant-` prefixed value works) | — |
 
-### Available Codex Models
+### Dynamic Model Discovery
 
-| Model | Tier | Description |
-|---|---|---|
-| `gpt-5.3-codex` | Mid | Default, best balance of speed and quality |
-| `gpt-5.2-codex` | Mid | Previous generation Codex model |
-| `gpt-5.1-codex` | Mid | GPT-5.1 based Codex model |
-| `gpt-5.1-codex-max` | High | Highest capability Codex model with maximum reasoning |
-| `gpt-5.1-codex-mini` | Fast | Lightweight fast Codex model |
-| `gpt-5.2` | Mid | General GPT-5.2 model |
-| `gpt-5.4` | High | Latest GPT-5.4 model |
+Claudex **automatically fetches the live list of available Codex models** from the Codex API on startup. This replaces a hardcoded model table that would go stale as new models are released.
 
-When no model is explicitly configured, Claudex automatically maps Anthropic model names:
-- `claude-*-opus-*` → `gpt-5.1-codex-max` (highest capability)
-- `claude-*-sonnet-*` → `gpt-5.3-codex` (balanced)
-- `claude-*-haiku-*` → `gpt-5.1-codex-mini` (fastest)
+**How it works:**
+
+1. On startup, Claudex calls the Codex backend's `/models` endpoint to fetch all models that are currently available and supported via the API.
+2. Models are classified into tiers based on their naming conventions:
+   - **High tier** (Opus mapping) — models with `max` or `pro` in the name (highest capability)
+   - **Mid tier** (Sonnet mapping) — default/balanced models
+   - **Fast tier** (Haiku mapping) — models with `mini`, `fast`, or `lite` in the name
+3. The tier mapping is used when Claudex receives an Anthropic model name like `claude-3-5-sonnet-20241022` — it automatically maps to the best available Codex model for that tier.
+4. If the models endpoint is unreachable (network error, auth error, etc.), Claudex falls back to a hardcoded default list and logs a warning.
+
+**View live models:**
+
+```bash
+curl http://localhost:4000/claudex/models
+```
+
+Response includes the model list, the tier mapping, and the last fetch timestamp.
+
+**Refresh at runtime:**
+
+```bash
+curl -X POST http://localhost:4000/claudex/models/refresh
+```
+
+**Refresh from CLI (and exit):**
+
+```bash
+claudex --refresh-models
+```
+
+**Automatic periodic refresh:** set `CODEX_MODEL_REFRESH_INTERVAL` (in milliseconds, default 1 hour).
 
 ---
 
@@ -358,7 +379,7 @@ Auth Flow — Reuse (--reuse-codex):
 |---|---|---|---|
 | `messages[]` | → | `input[]` | Role and content converted |
 | `system` (string or array) | → | `instructions` | Array entries joined with newline |
-| `tools[].input_schema` | → | `tools[].function.parameters` | Wrapped in `type: "function"` |
+| `tools[].input_schema` | → | `tools[].parameters` | Flat format with `type: "function"`, `name`, `strict: true` |
 | `stream: true` | → | `stream: true` | Direct passthrough |
 | — | → | `store: false` | Always set (required by Codex) |
 | — | → | `tool_choice: "auto"` | Set when tools are present |
@@ -389,7 +410,8 @@ Auth Flow — Reuse (--reuse-codex):
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/messages` | Main proxy route (Anthropic Messages API) |
-| `GET` | `/claudex/models` | List available Codex models with descriptions |
+| `GET` | `/claudex/models` | List available Codex models, tier mapping, and last fetch time |
+| `POST` | `/claudex/models/refresh` | Re-fetch the model list from the Codex API |
 | `POST` | `/claudex/config` | Update runtime model/reasoning configuration |
 | `GET` | `/health` | Health check |
 
@@ -397,6 +419,12 @@ Auth Flow — Reuse (--reuse-codex):
 
 ```bash
 curl http://localhost:4000/claudex/models
+```
+
+**Example: Refresh model list**
+
+```bash
+curl -X POST http://localhost:4000/claudex/models/refresh
 ```
 
 **Example: Update runtime config**
@@ -414,14 +442,16 @@ curl -X POST http://localhost:4000/claudex/config \
 ```
 claudex/
 ├── src/
-│   ├── index.ts        # CLI entry point, argument parsing, --model / --reasoning / --reuse-codex
-│   ├── server.ts       # HTTP proxy server (POST /v1/messages, GET /claudex/models, POST /claudex/config)
+│   ├── index.ts        # CLI entry point, argument parsing, --model / --reasoning / --reuse-codex / --refresh-models
+│   ├── server.ts       # HTTP proxy server (POST /v1/messages, GET /claudex/models, POST /claudex/models/refresh, POST /claudex/config)
 │   ├── oauth.ts        # ChatGPT OAuth (PKCE flow + token refresh)
 │   ├── token.ts        # Session persistence + external credential detection
 │   ├── converter.ts    # Bidirectional format converter + SSE stream converter + model mapping
+│   ├── models.ts       # Dynamic model discovery — fetch and cache live model list from Codex API
 │   └── logger.ts       # Structured logging with colors
 ├── tests/
 │   ├── converter.test.ts   # Unit tests for format conversion, model mapping, streaming
+│   ├── models.test.ts      # Unit tests for dynamic model discovery
 │   └── token.test.ts       # Unit tests for credential parsing
 ├── package.json
 ├── tsconfig.json

@@ -18,6 +18,7 @@ import {
   CODEX_MODELS,
   type AnthropicRequest,
 } from "../src/converter.js";
+import { _resetForTesting, getModels } from "../src/models.js";
 
 describe("anthropicToCodex", () => {
   it("should convert a simple text request", () => {
@@ -109,8 +110,9 @@ describe("anthropicToCodex", () => {
     assert.ok(result.tools);
     assert.equal(result.tools!.length, 1);
     assert.equal(result.tools![0].type, "function");
-    assert.equal(result.tools![0].function.name, "get_weather");
-    assert.equal(result.tools![0].function.description, "Get current weather");
+    assert.equal(result.tools![0].name, "get_weather");
+    assert.equal(result.tools![0].description, "Get current weather");
+    assert.equal(result.tools![0].strict, true);
   });
 
   it("should convert stream flag", () => {
@@ -594,11 +596,13 @@ describe("StreamConverter additional events", () => {
 });
 
 describe("CODEX_MODELS", () => {
-  it("should contain expected models", () => {
-    assert.ok(CODEX_MODELS["gpt-5.3-codex"]);
-    assert.ok(CODEX_MODELS["gpt-5.1-codex-max"]);
-    assert.ok(CODEX_MODELS["gpt-5.1-codex-mini"]);
-    assert.equal(CODEX_MODELS["gpt-5.1-codex-max"].tier, "high");
-    assert.equal(CODEX_MODELS["gpt-5.1-codex-mini"].tier, "fast");
+  it("should contain expected models from fallback list", () => {
+    _resetForTesting();
+    const models = getModels();
+    assert.ok(models["gpt-5.3-codex"]);
+    assert.ok(models["gpt-5.1-codex-max"]);
+    assert.ok(models["gpt-5.1-codex-mini"]);
+    assert.equal(models["gpt-5.1-codex-max"].tier, "high");
+    assert.equal(models["gpt-5.1-codex-mini"].tier, "fast");
   });
 });
