@@ -261,6 +261,10 @@ const ALLOWED_REQUEST_FIELDS = new Set<string>([
   "text",
 ]);
 
+// These schema containers are traversed recursively even if some of them are
+// stripped later by the whitelist. This keeps normalization genuinely
+// recursive across the full schema tree before unsupported containers are
+// removed from the final payload.
 const SCHEMA_MAP_KEYWORDS = new Set<string>([
   "properties",
   "patternProperties",
@@ -334,14 +338,19 @@ function normalizeNestedSchemaValue(key: string, value: unknown): unknown {
   }
 
   if (SCHEMA_ARRAY_KEYWORDS.has(key)) {
-    return Array.isArray(value) ? value.map((item) => normalizeSchema(item)) : value;
+    return Array.isArray(value)
+      ? value.map((item) => normalizeSchema(item))
+      : undefined;
   }
 
   if (SCHEMA_KEYWORDS.has(key)) {
     if (Array.isArray(value)) {
       return value.map((item) => normalizeSchema(item));
     }
-    return isRecord(value) ? normalizeSchema(value) : value;
+    if (typeof value === "boolean") {
+      return value;
+    }
+    return isRecord(value) ? normalizeSchema(value) : undefined;
   }
 
   return value;
@@ -367,6 +376,8 @@ export function normalizeSchema(node: unknown): unknown {
   const normalized: Record<string, unknown> = {};
 
   for (const [key, rawValue] of Object.entries(source)) {
+    // Normalize nested schema-bearing containers first so unsupported wrapper
+    // keywords do not block recursion into the schema tree.
     const value = normalizeNestedSchemaValue(key, rawValue);
     if (!ALLOWED_SCHEMA_KEYWORDS.has(key)) {
       continue;
@@ -389,6 +400,7 @@ export function normalizeSchema(node: unknown): unknown {
   return normalized;
 }
 
+/** @deprecated Use normalizeSchema instead. Kept for compatibility with existing callers/tests. */
 export const sanitizeToolSchema = normalizeSchema;
 
 function normalizeCodexRequestBody(req: CodexRequest): CodexRequest {
