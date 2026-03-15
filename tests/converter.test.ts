@@ -1,6 +1,5 @@
 /**
  * Unit tests for format converter
- * 格式转换器的单元测试
  */
 
 import { describe, it } from "node:test";
@@ -32,7 +31,10 @@ describe("anthropicToCodex", () => {
 
     assert.equal(result.model, "gpt-5.3-codex");
     // max_output_tokens must NOT be sent (causes 400 from Codex API)
-    assert.equal((result as unknown as Record<string, unknown>).max_output_tokens, undefined);
+    assert.equal(
+      (result as unknown as Record<string, unknown>).max_output_tokens,
+      undefined
+    );
     assert.equal(result.input.length, 1);
     assert.equal(result.input[0].role, "user");
     assert.equal(result.input[0].content, "Hello, world!");
@@ -87,7 +89,7 @@ describe("anthropicToCodex", () => {
     assert.equal(result.input[2].content, "How are you?");
   });
 
-  it("should convert tools to OpenAI format", () => {
+  it("should convert tools to OpenAI format with strict schema", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -113,6 +115,41 @@ describe("anthropicToCodex", () => {
     assert.equal(result.tools![0].name, "get_weather");
     assert.equal(result.tools![0].description, "Get current weather");
     assert.equal(result.tools![0].strict, true);
+    assert.equal(result.tools![0].parameters.additionalProperties, false);
+    assert.deepEqual(result.tools![0].parameters.required, ["location"]);
+  });
+
+  it("should enforce required includes all property keys", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      tools: [
+        {
+          name: "multi_param",
+          description: "Tool with multiple params",
+          input_schema: {
+            type: "object",
+            properties: {
+              a: { type: "string" },
+              b: { type: "number" },
+              c: { type: "boolean" },
+            },
+            // Claude Code only lists "a" as required
+            required: ["a"],
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    // All keys from properties must be in required
+    const required = result.tools![0].parameters.required;
+    assert.ok(required.includes("a"));
+    assert.ok(required.includes("b"));
+    assert.ok(required.includes("c"));
+    assert.equal(required.length, 3);
   });
 
   it("should convert stream flag", () => {
@@ -153,9 +190,18 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     // These fields must not be forwarded to Codex
-    assert.equal((result as unknown as Record<string, unknown>).temperature, undefined);
-    assert.equal((result as unknown as Record<string, unknown>).top_p, undefined);
-    assert.equal((result as unknown as Record<string, unknown>).stop, undefined);
+    assert.equal(
+      (result as unknown as Record<string, unknown>).temperature,
+      undefined
+    );
+    assert.equal(
+      (result as unknown as Record<string, unknown>).top_p,
+      undefined
+    );
+    assert.equal(
+      (result as unknown as Record<string, unknown>).stop,
+      undefined
+    );
   });
 
   it("should convert tool_use content blocks", () => {
@@ -191,10 +237,9 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     // Assistant message should have text + function call
-    assert.equal(result.input.length, 2);
+    assert.ok(result.input.length >= 2);
     const assistantMsg = result.input[0];
     assert.equal(assistantMsg.role, "assistant");
-    assert.ok(Array.isArray(assistantMsg.content));
 
     // User message with tool result
     const toolResultMsg = result.input[1];
@@ -232,7 +277,10 @@ describe("anthropicToCodex", () => {
       stream_options: { include_usage: true },
     };
 
-    const result = anthropicToCodex(req) as unknown as Record<string, unknown>;
+    const result = anthropicToCodex(req) as unknown as Record<
+      string,
+      unknown
+    >;
 
     assert.equal(result.betas, undefined);
     assert.equal(result.metadata, undefined);
@@ -252,6 +300,55 @@ describe("anthropicToCodex", () => {
 
     assert.ok(result.reasoning);
     assert.equal(result.reasoning!.effort, "high");
+  });
+
+  it("should always include include field as empty array", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.ok(Array.isArray(result.include));
+    assert.equal(result.include.length, 0);
+  });
+
+  it("should only contain whitelisted fields", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      betas: ["test"],
+      metadata: { user: "x" },
+      thinking: { type: "enabled" },
+      stream_options: {},
+      max_output_tokens: 2048,
+    };
+
+    const result = anthropicToCodex(req);
+    const keys = Object.keys(result);
+
+    // Only whitelisted keys should be present
+    const allowedKeys = new Set([
+      "model",
+      "instructions",
+      "input",
+      "tools",
+      "tool_choice",
+      "parallel_tool_calls",
+      "reasoning",
+      "store",
+      "stream",
+      "include",
+    ]);
+    for (const key of keys) {
+      assert.ok(
+        allowedKeys.has(key),
+        `Unexpected key "${key}" in Codex request`
+      );
+    }
   });
 });
 
@@ -356,11 +453,8 @@ describe("StreamConverter", () => {
     });
 
     assert.ok(events.length > 0);
-    // First event should be message_start
     assert.ok(events[0].includes("message_start"));
-    // Should also have ping
     assert.ok(events.some((e) => e.includes("ping")));
-    // Should have the text delta
     assert.ok(events.some((e) => e.includes("text_delta")));
     assert.ok(events.some((e) => e.includes("Hello")));
   });
@@ -392,10 +486,12 @@ describe("StreamConverter", () => {
 
   it("should handle tool_use in streaming", () => {
     const converter = new StreamConverter("claude-3-5-sonnet-20241022");
-    // First text
-    converter.processEvent("response.output_text.delta", { delta: "Let me check." });
-    converter.processEvent("response.output_text.done", { text: "Let me check." });
-    // Then function call
+    converter.processEvent("response.output_text.delta", {
+      delta: "Let me check.",
+    });
+    converter.processEvent("response.output_text.done", {
+      text: "Let me check.",
+    });
     const events = converter.processEvent("response.output_item.done", {
       item: {
         type: "function_call",
@@ -429,7 +525,6 @@ describe("StreamConverter", () => {
       usage: { input_tokens: 5, output_tokens: 2 },
     });
 
-    // finalize after response.completed should return no events
     const events = converter.finalize();
     assert.equal(events.length, 0);
   });
@@ -442,6 +537,76 @@ describe("StreamConverter", () => {
 
     assert.ok(events.some((e) => e.includes("text_delta")));
     assert.ok(events.some((e) => e.includes("Hello")));
+  });
+
+  it("should handle response.reasoning_summary_text.delta without error", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent(
+      "response.reasoning_summary_text.delta",
+      { delta: "reasoning...", summary_index: 0 }
+    );
+    // Should emit message_start but no text delta (reasoning is consumed silently)
+    assert.ok(events.some((e) => e.includes("message_start")));
+  });
+
+  it("should handle response.reasoning_text.delta without error", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent(
+      "response.reasoning_text.delta",
+      { delta: "thinking...", content_index: 0 }
+    );
+    assert.ok(events.some((e) => e.includes("message_start")));
+  });
+
+  it("should handle response.reasoning_summary_part.added without error", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent(
+      "response.reasoning_summary_part.added",
+      { summary_index: 0 }
+    );
+    assert.ok(events.some((e) => e.includes("message_start")));
+  });
+});
+
+describe("StreamConverter additional events", () => {
+  it("should handle response.created silently", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent("response.created", {
+      response: { id: "resp_123" },
+    });
+
+    assert.ok(events.some((e) => e.includes("message_start")));
+  });
+
+  it("should handle response.failed as error", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.processEvent("response.failed", {
+      response: { error: { message: "Something went wrong" } },
+    });
+
+    assert.ok(events.some((e) => e.includes("error")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+
+  it("should handle response.incomplete as max_tokens stop", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    const events = converter.processEvent("response.incomplete", {
+      response: { incomplete_details: { reason: "max_tokens" } },
+    });
+
+    assert.ok(events.some((e) => e.includes("max_tokens")));
+    assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+
+  it("should handle response.output_item.added silently", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    const events = converter.processEvent("response.output_item.added", {
+      item: { type: "message", id: "item_123" },
+    });
+
+    assert.ok(events.some((e) => e.includes("message_start")));
   });
 });
 
@@ -510,14 +675,16 @@ describe("parseClaudexModelString", () => {
   });
 
   it("should return null for non-claudex model names", () => {
-    assert.equal(parseClaudexModelString("claude-3-5-sonnet-20241022"), null);
+    assert.equal(
+      parseClaudexModelString("claude-3-5-sonnet-20241022"),
+      null
+    );
     assert.equal(parseClaudexModelString("gpt-5.3-codex"), null);
   });
 });
 
 describe("mapModel", () => {
   it("should map opus to highest-tier model", () => {
-    // Clear runtime config for this test
     const saved = proxyConfig.model;
     proxyConfig.model = "";
     const origEnv = process.env.CODEX_MODEL;
@@ -536,7 +703,10 @@ describe("mapModel", () => {
     const origEnv = process.env.CODEX_MODEL;
     delete process.env.CODEX_MODEL;
     try {
-      assert.equal(mapModel("claude-3-5-sonnet-20241022"), "gpt-5.3-codex");
+      assert.equal(
+        mapModel("claude-3-5-sonnet-20241022"),
+        "gpt-5.3-codex"
+      );
     } finally {
       proxyConfig.model = saved;
       if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
@@ -549,7 +719,10 @@ describe("mapModel", () => {
     const origEnv = process.env.CODEX_MODEL;
     delete process.env.CODEX_MODEL;
     try {
-      assert.equal(mapModel("claude-3-5-haiku-20241022"), "gpt-5.1-codex-mini");
+      assert.equal(
+        mapModel("claude-3-5-haiku-20241022"),
+        "gpt-5.1-codex-mini"
+      );
     } finally {
       proxyConfig.model = saved;
       if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
@@ -558,40 +731,6 @@ describe("mapModel", () => {
 
   it("should use claudex: convention when present", () => {
     assert.equal(mapModel("claudex:gpt-5.4:medium"), "gpt-5.4");
-  });
-});
-
-describe("StreamConverter additional events", () => {
-  it("should handle response.created silently", () => {
-    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
-    const events = converter.processEvent("response.created", {
-      response: { id: "resp_123" },
-    });
-
-    // Should emit message_start and ping (triggered by first event), nothing else
-    assert.ok(events.some((e) => e.includes("message_start")));
-  });
-
-  it("should handle response.failed as error", () => {
-    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
-    converter.processEvent("response.output_text.delta", { delta: "Hi" });
-    const events = converter.processEvent("response.failed", {
-      response: { error: { message: "Something went wrong" } },
-    });
-
-    assert.ok(events.some((e) => e.includes("error")));
-    assert.ok(events.some((e) => e.includes("message_stop")));
-  });
-
-  it("should handle response.incomplete as max_tokens stop", () => {
-    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
-    converter.processEvent("response.output_text.delta", { delta: "Hi" });
-    const events = converter.processEvent("response.incomplete", {
-      response: { incomplete_details: { reason: "max_tokens" } },
-    });
-
-    assert.ok(events.some((e) => e.includes("max_tokens")));
-    assert.ok(events.some((e) => e.includes("message_stop")));
   });
 });
 

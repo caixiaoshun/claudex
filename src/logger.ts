@@ -1,6 +1,5 @@
 /**
- * Logger module — simple structured logging
- * 日志模块 — 简洁的结构化日志
+ * Logger module — structured console logging with levels and colors.
  */
 
 export enum LogLevel {
@@ -14,6 +13,10 @@ let currentLevel = LogLevel.INFO;
 
 export function setLogLevel(level: LogLevel): void {
   currentLevel = level;
+}
+
+export function getLogLevel(): LogLevel {
+  return currentLevel;
 }
 
 function timestamp(): string {
@@ -43,10 +46,10 @@ export function error(msg: string, data?: Record<string, unknown>): void {
   console.error(`\x1b[31m[${timestamp()}] ERR\x1b[0m ${msg}${extra}`);
 }
 
-/**
- * Log a request summary: [model] [~tokens] [status]
- * 请求摘要日志：[模型] [~token数] [状态]
- */
-export function requestLog(model: string, estimatedTokens: number, status: string): void {
+export function requestLog(
+  model: string,
+  estimatedTokens: number,
+  status: string
+): void {
   info(`[${model}] [~${estimatedTokens} tokens] [${status}]`);
 }

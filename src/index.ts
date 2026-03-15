@@ -3,9 +3,6 @@
 /**
  * Claudex — CLI entry point
  * Bridge Claude Code to ChatGPT Codex via local proxy
- *
- * Claudex — CLI 入口
- * 通过本地代理将 Claude Code 桥接到 ChatGPT Codex
  */
 
 import * as logger from "./logger.js";
@@ -40,7 +37,7 @@ function printBanner(): void {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  let port = DEFAULT_PORT;
+  let port = parseInt(process.env.PROXY_PORT || "", 10) || DEFAULT_PORT;
   let reuseCodex = false;
   let listSources = false;
   let refreshModelsFlag = false;
@@ -59,7 +56,9 @@ async function main(): Promise<void> {
     } else if (args[i] === "--reasoning" && args[i + 1]) {
       const val = args[i + 1];
       if (!["low", "medium", "high"].includes(val)) {
-        console.error("Invalid reasoning level. Must be low, medium, or high.");
+        console.error(
+          "Invalid reasoning level. Must be low, medium, or high."
+        );
         process.exit(1);
       }
       proxyConfig.reasoning = val as "low" | "medium" | "high";
@@ -89,7 +88,7 @@ async function main(): Promise<void> {
 
   printBanner();
 
-  // --reuse-codex: import credentials from an existing Codex/opencode installation
+  // --reuse-codex: import credentials from an existing installation
   if (reuseCodex) {
     const imported = handleReuseCodex();
     if (!imported) {
@@ -117,7 +116,6 @@ async function main(): Promise<void> {
     const session = await oauth.getValidSession();
     await initModels(session.access_token, session.account_id);
   } catch {
-    // initModels falls back to defaults internally; just log here
     await initModels();
   }
 
@@ -140,14 +138,16 @@ async function main(): Promise<void> {
   }
 
   // Step 3: Start periodic model refresh
-  const refreshIntervalMs = parseInt(
-    process.env.CODEX_MODEL_REFRESH_INTERVAL || "",
-    10
-  ) || DEFAULT_REFRESH_INTERVAL_MS;
+  const refreshIntervalMs =
+    parseInt(process.env.CODEX_MODEL_REFRESH_INTERVAL || "", 10) ||
+    DEFAULT_REFRESH_INTERVAL_MS;
   startPeriodicRefresh(refreshIntervalMs, async () => {
     try {
       const s = await oauth.getValidSession();
-      return { access_token: s.access_token, account_id: s.account_id };
+      return {
+        access_token: s.access_token,
+        account_id: s.account_id,
+      };
     } catch {
       return null;
     }
@@ -156,7 +156,8 @@ async function main(): Promise<void> {
   // Step 4: Start proxy server
   const server = startServer(port);
 
-  const modelDisplay = proxyConfig.model || "(auto-mapped from Claude Code model)";
+  const modelDisplay =
+    proxyConfig.model || "(auto-mapped from Claude Code model)";
   const reasoningDisplay = proxyConfig.reasoning || "(auto)";
 
   console.log(`
@@ -184,10 +185,6 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-/**
- * Print all detected external credential sources to stdout.
- * 将所有检测到的外部凭证来源打印到 stdout。
- */
 function handleListSources(): void {
   const sources = token.detectExternalSources();
   if (sources.length === 0) {
@@ -224,21 +221,10 @@ function handleListSources(): void {
   );
 }
 
-/**
- * Attempt to import credentials from the first suitable external source.
- * Returns true if a source was successfully imported.
- *
- * 尝试从第一个合适的外部来源导入凭证。
- * 成功导入返回 true。
- */
 function handleReuseCodex(): boolean {
   const sources = token.detectExternalSources();
+  if (sources.length === 0) return false;
 
-  if (sources.length === 0) {
-    return false;
-  }
-
-  // Prefer a non-expired source; fall back to the first one (refresh will handle it)
   const preferred =
     sources.find((s) => !token.isExpired(s.session)) ?? sources[0];
 
@@ -329,6 +315,8 @@ Examples:
 }
 
 main().catch((err) => {
-  logger.error(`Fatal: ${err instanceof Error ? err.message : String(err)}`);
+  logger.error(
+    `Fatal: ${err instanceof Error ? err.message : String(err)}`
+  );
   process.exit(1);
 });

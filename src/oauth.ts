@@ -1,8 +1,8 @@
 /**
- * OAuth module — ChatGPT Codex authorization via PKCE flow
- * OAuth 模块 — 通过 PKCE 流程进行 ChatGPT Codex 授权
+ * OAuth module — ChatGPT Codex authorization via PKCE flow.
+ * Concurrent-safe token refresh using a single in-flight promise.
  *
- * Reference: https://github.com/anomalyco/opencode (packages/opencode/src/plugin/codex.ts)
+ * Reference: sst/opencode packages/opencode/src/plugin/codex.ts
  */
 
 import * as http from "node:http";
@@ -10,7 +10,6 @@ import * as crypto from "node:crypto";
 import * as logger from "./logger.js";
 import * as token from "./token.js";
 
-// Constants from reference implementation (opencode)
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER = "https://auth.openai.com";
 const OAUTH_PORT = 18457;
@@ -35,7 +34,7 @@ interface IdTokenClaims {
   };
 }
 
-// --- Crypto Helpers ---
+// ---------- Crypto ----------
 
 function generateRandomString(length: number): string {
   const chars =
@@ -66,7 +65,7 @@ async function generatePKCE(): Promise<PkceCodes> {
   return { verifier, challenge };
 }
 
-// --- JWT Parsing ---
+// ---------- JWT Parsing ----------
 
 function parseJwtClaims(jwtToken: string): IdTokenClaims | undefined {
   const parts = jwtToken.split(".");
@@ -101,24 +100,31 @@ function extractAccountId(tokens: TokenResponse): string | undefined {
   return undefined;
 }
 
-// --- Token Exchange ---
+// ---------- Token Exchange ----------
 
 async function exchangeCodeForTokens(
   code: string,
   redirectUri: string,
   pkce: PkceCodes
 ): Promise<TokenResponse> {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-      client_id: CLIENT_ID,
-      code_verifier: pkce.verifier,
-    }).toString(),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: CLIENT_ID,
+        code_verifier: pkce.verifier,
+      }).toString(),
+    });
+  } catch (err) {
+    throw new Error(
+      `Token exchange fetch failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(
@@ -128,18 +134,25 @@ async function exchangeCodeForTokens(
   return response.json() as Promise<TokenResponse>;
 }
 
-export async function refreshAccessToken(
+async function doRefreshAccessToken(
   refreshToken: string
 ): Promise<TokenResponse> {
-  const response = await fetch(`${ISSUER}/oauth/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: refreshToken,
-      client_id: CLIENT_ID,
-    }).toString(),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${ISSUER}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CLIENT_ID,
+      }).toString(),
+    });
+  } catch (err) {
+    throw new Error(
+      `Token refresh fetch failed: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     throw new Error(
@@ -149,7 +162,44 @@ export async function refreshAccessToken(
   return response.json() as Promise<TokenResponse>;
 }
 
-// --- OAuth HTML pages ---
+// ---------- Concurrent-safe refresh ----------
+
+let inflightRefresh: Promise<token.SessionData> | null = null;
+
+/**
+ * Refresh the access token, coalescing concurrent callers into a single
+ * in-flight request so simultaneous expired-token hits don't trigger
+ * multiple refreshes.
+ */
+export async function refreshAccessToken(
+  refreshToken: string,
+  existingAccountId?: string
+): Promise<token.SessionData> {
+  if (inflightRefresh) return inflightRefresh;
+
+  inflightRefresh = (async () => {
+    try {
+      const tokens = await doRefreshAccessToken(refreshToken);
+      const accountId =
+        extractAccountId(tokens) || existingAccountId;
+      const session: token.SessionData = {
+        access_token: tokens.access_token,
+        refresh_token: tokens.refresh_token,
+        expires_at:
+          Date.now() + (tokens.expires_in ?? 3600) * 1000,
+        account_id: accountId,
+      };
+      token.save(session);
+      return session;
+    } finally {
+      inflightRefresh = null;
+    }
+  })();
+
+  return inflightRefresh;
+}
+
+// ---------- OAuth HTML ----------
 
 const HTML_SUCCESS = `<!doctype html>
 <html>
@@ -183,12 +233,8 @@ p{color:#8b949e}
 <div class="error">${error}</div>
 </div></body></html>`;
 
-// --- OAuth Browser Flow ---
+// ---------- OAuth Browser Flow ----------
 
-/**
- * Start the OAuth flow: spin up a local callback server, open browser, wait for token exchange.
- * 启动 OAuth 流程：开启本地回调服务器，打开浏览器，等待 token 交换。
- */
 export async function authorize(): Promise<token.SessionData> {
   const pkce = await generatePKCE();
   const state = generateState();
@@ -198,17 +244,24 @@ export async function authorize(): Promise<token.SessionData> {
   return new Promise<token.SessionData>((resolve, reject) => {
     const timeout = setTimeout(() => {
       server.close();
-      reject(new Error("OAuth timeout - authorization took too long (5 min)"));
+      reject(
+        new Error("OAuth timeout - authorization took too long (5 min)")
+      );
     }, 5 * 60 * 1000);
 
     const server = http.createServer(async (req, res) => {
-      const url = new URL(req.url || "/", `http://localhost:${OAUTH_PORT}`);
+      const url = new URL(
+        req.url || "/",
+        `http://localhost:${OAUTH_PORT}`
+      );
 
       if (url.pathname === "/auth/callback") {
         const code = url.searchParams.get("code");
         const returnedState = url.searchParams.get("state");
         const error = url.searchParams.get("error");
-        const errorDescription = url.searchParams.get("error_description");
+        const errorDescription = url.searchParams.get(
+          "error_description"
+        );
 
         if (error) {
           const msg = errorDescription || error;
@@ -241,7 +294,11 @@ export async function authorize(): Promise<token.SessionData> {
         }
 
         try {
-          const tokens = await exchangeCodeForTokens(code, redirectUri, pkce);
+          const tokens = await exchangeCodeForTokens(
+            code,
+            redirectUri,
+            pkce
+          );
           const accountId = extractAccountId(tokens);
           const session: token.SessionData = {
             access_token: tokens.access_token,
@@ -257,7 +314,8 @@ export async function authorize(): Promise<token.SessionData> {
           server.close();
           resolve(session);
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg =
+            err instanceof Error ? err.message : String(err);
           res.writeHead(500, { "Content-Type": "text/html" });
           res.end(htmlError(msg));
           clearTimeout(timeout);
@@ -272,8 +330,12 @@ export async function authorize(): Promise<token.SessionData> {
     });
 
     server.listen(OAUTH_PORT, () => {
-      logger.info(`OAuth callback server listening on port ${OAUTH_PORT}`);
-      logger.info("Opening browser for ChatGPT authorization...");
+      logger.info(
+        `OAuth callback server listening on port ${OAUTH_PORT}`
+      );
+      logger.info(
+        "Opening browser for ChatGPT authorization..."
+      );
       logger.info(`If browser doesn't open, visit: ${authUrl}`);
       openBrowser(authUrl);
     });
@@ -281,7 +343,9 @@ export async function authorize(): Promise<token.SessionData> {
     server.on("error", (err) => {
       clearTimeout(timeout);
       reject(
-        new Error(`Failed to start OAuth server on port ${OAUTH_PORT}: ${err.message}`)
+        new Error(
+          `Failed to start OAuth server on port ${OAUTH_PORT}: ${err.message}`
+        )
       );
     });
   });
@@ -307,10 +371,8 @@ function buildAuthorizeUrl(
   return `${ISSUER}/oauth/authorize?${params.toString()}`;
 }
 
-/**
- * Ensure we have a valid session, refreshing or re-authorizing as needed.
- * 确保我们有一个有效的会话，根据需要刷新或重新授权。
- */
+// ---------- Session Management ----------
+
 export async function ensureSession(): Promise<token.SessionData> {
   let session = token.load();
 
@@ -322,17 +384,12 @@ export async function ensureSession(): Promise<token.SessionData> {
   if (session && session.refresh_token) {
     try {
       logger.info("Session expired, refreshing token...");
-      const tokens = await refreshAccessToken(session.refresh_token);
-      const accountId = extractAccountId(tokens) || session.account_id;
-      session = {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        expires_at: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-        account_id: accountId,
-      };
-      token.save(session);
+      const refreshed = await refreshAccessToken(
+        session.refresh_token,
+        session.account_id
+      );
       logger.info("Token refreshed successfully");
-      return session;
+      return refreshed;
     } catch (err) {
       logger.warn(
         `Token refresh failed: ${err instanceof Error ? err.message : String(err)}, re-authorizing...`
@@ -344,41 +401,39 @@ export async function ensureSession(): Promise<token.SessionData> {
   return authorize();
 }
 
-/**
- * Refresh the session if expired, returning the updated session.
- * 如果会话过期则刷新，返回更新后的会话。
- */
 export async function getValidSession(): Promise<token.SessionData> {
-  let session = token.load();
+  const session = token.load();
   if (!session) {
-    throw new Error("No session found. Please restart the proxy to re-authorize.");
+    throw new Error(
+      "No session found. Please restart the proxy to re-authorize."
+    );
   }
 
   if (token.isExpired(session)) {
     logger.info("Access token expired, refreshing...");
     try {
-      const tokens = await refreshAccessToken(session.refresh_token);
-      const accountId = extractAccountId(tokens) || session.account_id;
-      session = {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        expires_at: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-        account_id: accountId,
-      };
-      token.save(session);
+      const refreshed = await refreshAccessToken(
+        session.refresh_token,
+        session.account_id
+      );
       logger.info("Token refreshed successfully");
+      return refreshed;
     } catch {
-      throw new Error("Token refresh failed. Please restart the proxy to re-authorize.");
+      throw new Error(
+        "Token refresh failed. Please restart the proxy to re-authorize."
+      );
     }
   }
 
   return session;
 }
 
-// --- Utility ---
+// ---------- Utility ----------
 
 function openBrowser(url: string): void {
-  const { exec } = require("node:child_process") as typeof import("node:child_process");
+  const {
+    exec,
+  } = require("node:child_process") as typeof import("node:child_process");
   const platform = process.platform;
   let cmd: string;
   if (platform === "darwin") {
@@ -390,7 +445,9 @@ function openBrowser(url: string): void {
   }
   exec(cmd, (err: Error | null) => {
     if (err) {
-      logger.warn("Could not open browser automatically. Please open the URL manually.");
+      logger.warn(
+        "Could not open browser automatically. Please open the URL manually."
+      );
     }
   });
 }

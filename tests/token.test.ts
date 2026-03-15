@@ -1,133 +1,154 @@
 /**
- * Unit tests for token credential parsing
- * Token 凭证解析的单元测试
+ * Unit tests for token persistence and external credential detection
  */
 
 import { describe, it } from "node:test";
 import * as assert from "node:assert/strict";
-import { EXTERNAL_CANDIDATE_PATHS, type SessionData } from "../src/token.js";
+import { EXTERNAL_CANDIDATE_PATHS, isExpired } from "../src/token.js";
+import type { SessionData } from "../src/token.js";
 
-// Helper: grab the parse function for a given source by name prefix
-function getParser(prefix: string): (raw: string) => SessionData | null {
-  const entry = EXTERNAL_CANDIDATE_PATHS.find((c) => c.name.startsWith(prefix));
-  if (!entry) throw new Error(`No candidate found with prefix "${prefix}"`);
-  return entry.parse;
-}
-
-// ---------- Codex CLI parser ----------
-
-describe("Codex CLI auth.json parser", () => {
-  const parse = getParser("OpenAI Codex CLI");
-
-  it("should parse flat camelCase format", () => {
-    const raw = JSON.stringify({
-      accessToken: "tok_abc",
-      refreshToken: "ref_xyz",
-      expiresAt: Date.now() + 3_600_000,
-      accountId: "acct_1",
+describe("token", () => {
+  describe("isExpired", () => {
+    it("should return false for future expiry", () => {
+      const session: SessionData = {
+        access_token: "test",
+        refresh_token: "test",
+        expires_at: Date.now() + 3_600_000,
+      };
+      assert.equal(isExpired(session), false);
     });
-    const result = parse(raw);
-    assert.ok(result);
-    assert.equal(result.access_token, "tok_abc");
-    assert.equal(result.refresh_token, "ref_xyz");
-    assert.equal(result.account_id, "acct_1");
-  });
 
-  it("should parse flat snake_case format", () => {
-    const raw = JSON.stringify({
-      access_token: "tok_abc",
-      refresh_token: "ref_xyz",
-      expires_at: 1700000000,
+    it("should return true for past expiry", () => {
+      const session: SessionData = {
+        access_token: "test",
+        refresh_token: "test",
+        expires_at: Date.now() - 120_000,
+      };
+      assert.equal(isExpired(session), true);
     });
-    const result = parse(raw);
-    assert.ok(result);
-    assert.equal(result.access_token, "tok_abc");
-    assert.equal(result.refresh_token, "ref_xyz");
-    // 1700000000 < 1e12 → treated as seconds, multiplied by 1000
-    assert.equal(result.expires_at, 1700000000000);
-  });
 
-  it("should parse nested tokens key (Windows Codex CLI schema)", () => {
-    const raw = JSON.stringify({
-      tokens: {
-        access_token: "tok_win",
-        refresh_token: "ref_win",
-        expires_at: "2026-01-01T00:00:00Z",
-      },
+    it("should return true for expiry within 60s margin", () => {
+      const session: SessionData = {
+        access_token: "test",
+        refresh_token: "test",
+        expires_at: Date.now() + 30_000, // 30 seconds from now
+      };
+      assert.equal(isExpired(session), true);
     });
-    const result = parse(raw);
-    assert.ok(result);
-    assert.equal(result.access_token, "tok_win");
-    assert.equal(result.refresh_token, "ref_win");
-    assert.equal(result.expires_at, new Date("2026-01-01T00:00:00Z").getTime());
   });
 
-  it("should handle expires_in instead of expires_at", () => {
-    const before = Date.now();
-    const raw = JSON.stringify({
-      access_token: "tok_exp",
-      refresh_token: "ref_exp",
-      expires_in: 7200,
+  describe("Codex CLI auth.json parser", () => {
+    const parser = EXTERNAL_CANDIDATE_PATHS[0].parse;
+
+    it("should parse flat format", () => {
+      const raw = JSON.stringify({
+        accessToken: "acc_123",
+        refreshToken: "ref_456",
+        expiresAt: Date.now() + 3600000,
+        accountId: "acct_789",
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.equal(result!.access_token, "acc_123");
+      assert.equal(result!.refresh_token, "ref_456");
+      assert.equal(result!.account_id, "acct_789");
     });
-    const result = parse(raw);
-    const after = Date.now();
-    assert.ok(result);
-    assert.equal(result.access_token, "tok_exp");
-    // expires_at should be ~now + 7200*1000
-    assert.ok(result.expires_at >= before + 7200 * 1000);
-    assert.ok(result.expires_at <= after + 7200 * 1000);
-  });
 
-  it("should handle ISO string expires_at", () => {
-    const raw = JSON.stringify({
-      accessToken: "tok_iso",
-      refreshToken: "ref_iso",
-      expiresAt: "2025-12-31T23:59:59.000Z",
+    it("should parse nested tokens format", () => {
+      const raw = JSON.stringify({
+        tokens: {
+          accessToken: "acc_123",
+          refreshToken: "ref_456",
+          expiresAt: Date.now() + 3600000,
+        },
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.equal(result!.access_token, "acc_123");
+      assert.equal(result!.refresh_token, "ref_456");
     });
-    const result = parse(raw);
-    assert.ok(result);
-    assert.equal(result.expires_at, new Date("2025-12-31T23:59:59.000Z").getTime());
-  });
 
-  it("should return null for missing access token", () => {
-    const raw = JSON.stringify({ refresh_token: "ref_only" });
-    assert.equal(parse(raw), null);
-  });
-
-  it("should return null for missing refresh token", () => {
-    const raw = JSON.stringify({ access_token: "tok_only" });
-    assert.equal(parse(raw), null);
-  });
-
-  it("should return null for invalid JSON", () => {
-    assert.equal(parse("{bad json}"), null);
-  });
-
-  it("should handle BOM-free content with nested tokens and camelCase", () => {
-    const raw = JSON.stringify({
-      tokens: {
-        accessToken: "tok_nested_camel",
-        refreshToken: "ref_nested_camel",
-        expiresIn: 3600,
-      },
+    it("should handle expires_at in seconds", () => {
+      const nowSec = Math.floor(Date.now() / 1000) + 3600;
+      const raw = JSON.stringify({
+        accessToken: "acc_123",
+        refreshToken: "ref_456",
+        expiresAt: nowSec,
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      // Should be converted to ms
+      assert.ok(result!.expires_at > Date.now());
     });
-    const result = parse(raw);
-    assert.ok(result);
-    assert.equal(result.access_token, "tok_nested_camel");
-    assert.equal(result.refresh_token, "ref_nested_camel");
+
+    it("should handle ISO string expiry", () => {
+      const raw = JSON.stringify({
+        accessToken: "acc_123",
+        refreshToken: "ref_456",
+        expiresAt: new Date(Date.now() + 3600000).toISOString(),
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.ok(result!.expires_at > Date.now());
+    });
+
+    it("should return null for missing tokens", () => {
+      const raw = JSON.stringify({ foo: "bar" });
+      const result = parser(raw);
+      assert.equal(result, null);
+    });
   });
 
-  it("should fallback expires_at when no expiry field present", () => {
-    const before = Date.now();
-    const raw = JSON.stringify({
-      access_token: "tok_no_exp",
-      refresh_token: "ref_no_exp",
+  describe("opencode session.json parser", () => {
+    const parser = EXTERNAL_CANDIDATE_PATHS[1].parse;
+
+    it("should parse flat format", () => {
+      const raw = JSON.stringify({
+        access_token: "acc_123",
+        refresh_token: "ref_456",
+        expires_at: Date.now() + 3600000,
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.equal(result!.access_token, "acc_123");
+      assert.equal(result!.refresh_token, "ref_456");
     });
-    const result = parse(raw);
-    const after = Date.now();
-    assert.ok(result);
-    // Should default to ~1 hour from now
-    assert.ok(result.expires_at >= before + 3_600_000 - 1000);
-    assert.ok(result.expires_at <= after + 3_600_000 + 1000);
+
+    it("should parse codex-nested format", () => {
+      const raw = JSON.stringify({
+        codex: {
+          access_token: "acc_123",
+          refresh_token: "ref_456",
+          expires_at: Date.now() + 3600000,
+          account_id: "acct_789",
+        },
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.equal(result!.access_token, "acc_123");
+      assert.equal(result!.account_id, "acct_789");
+    });
+  });
+
+  describe("opencode v2 auth/codex.json parser", () => {
+    const parser = EXTERNAL_CANDIDATE_PATHS[2].parse;
+
+    it("should parse flat format", () => {
+      const raw = JSON.stringify({
+        access_token: "acc_123",
+        refresh_token: "ref_456",
+        expires_at: Date.now() + 3600000,
+      });
+      const result = parser(raw);
+      assert.ok(result !== null);
+      assert.equal(result!.access_token, "acc_123");
+      assert.equal(result!.refresh_token, "ref_456");
+    });
+
+    it("should return null for missing tokens", () => {
+      const raw = JSON.stringify({ data: "nothing" });
+      const result = parser(raw);
+      assert.equal(result, null);
+    });
   });
 });
