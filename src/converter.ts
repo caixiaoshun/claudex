@@ -122,6 +122,7 @@ interface OpenAIResponsesRequest {
   model: string;
   instructions?: string;
   input: OpenAIInputMessage[];
+  store: boolean;
   stream?: boolean;
   temperature?: number;
   top_p?: number;
@@ -180,6 +181,7 @@ export function anthropicToCodex(req: AnthropicRequest): OpenAIResponsesRequest 
   const result: OpenAIResponsesRequest = {
     model,
     input,
+    store: false,
     stream: req.stream,
   };
 
@@ -402,6 +404,7 @@ export class StreamConverter {
   private messageId: string;
   private requestModel: string;
   private started = false;
+  private completed = false;
   private contentIndex = 0;
   private currentBlockOpen = false;
   private outputTokens = 0;
@@ -568,6 +571,7 @@ export class StreamConverter {
         events.push(
           this.formatSSE("message_stop", { type: "message_stop" })
         );
+        this.completed = true;
         break;
       }
 
@@ -645,6 +649,7 @@ export class StreamConverter {
    * Generate a final message_stop if the stream ended without a proper completion event.
    */
   finalize(): string[] {
+    if (this.completed) return [];
     const events: string[] = [];
     if (this.currentBlockOpen) {
       events.push(
@@ -666,6 +671,7 @@ export class StreamConverter {
       events.push(
         this.formatSSE("message_stop", { type: "message_stop" })
       );
+      this.completed = true;
     }
     return events;
   }
