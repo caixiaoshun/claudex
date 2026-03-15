@@ -64,7 +64,29 @@ npm install -g .
 
 ---
 
-### 2. Start the Proxy
+### 2. Bypass Claude Code Onboarding
+
+Claude Code v2+ checks for a Claude Pro/Max subscription on first launch and shows a login wizard. Since Claudex replaces the backend entirely, you don't need a Claude subscription — but you do need to tell Claude Code that onboarding is already done.
+
+Run this **once**, before starting Claude Code for the first time:
+
+**macOS / Linux / Windows (any terminal with Node.js):**
+
+```bash
+node --eval "
+const fs = require('fs'), path = require('path'), os = require('os');
+const filePath = path.join(os.homedir(), '.claude.json');
+const content = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf-8')) : {};
+fs.writeFileSync(filePath, JSON.stringify({ ...content, hasCompletedOnboarding: true }, null, 2), 'utf-8');
+console.log('Done:', filePath);
+"
+```
+
+This writes `{ "hasCompletedOnboarding": true }` into `~/.claude.json` (or merges it if the file already exists). Claude Code reads this flag on startup and skips the login wizard. It does **not** affect any real Claude credentials — Claudex handles all authentication separately.
+
+---
+
+### 3. Start the Proxy
 
 **If you already use Codex CLI or opencode** (see [Reuse Existing Credentials](#-reuse-existing-credentials)):
 
@@ -82,7 +104,7 @@ Your browser will open for ChatGPT authorization. Log in and approve access — 
 
 ---
 
-### 3. Configure Claude Code
+### 4. Configure Claude Code
 
 Point Claude Code at the local proxy by setting two environment variables. Keep the proxy terminal running and open a **new terminal** for this step.
 
@@ -90,28 +112,28 @@ Point Claude Code at the local proxy by setting two environment variables. Keep 
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:4000
-export ANTHROPIC_API_KEY=placeholder
+export ANTHROPIC_API_KEY=sk-ant-placeholder
 ```
 
 **Windows — PowerShell:**
 
 ```powershell
 $env:ANTHROPIC_BASE_URL = "http://localhost:4000"
-$env:ANTHROPIC_API_KEY  = "placeholder"
+$env:ANTHROPIC_API_KEY  = "sk-ant-placeholder"
 ```
 
 **Windows — Command Prompt (cmd.exe):**
 
 ```cmd
 set ANTHROPIC_BASE_URL=http://localhost:4000
-set ANTHROPIC_API_KEY=placeholder
+set ANTHROPIC_API_KEY=sk-ant-placeholder
 ```
 
 > **Note:** Variables set this way only apply to the current terminal session. To make them permanent, see [Persisting Environment Variables](#-persisting-environment-variables).
 
 ---
 
-### 4. Use Claude Code Normally
+### 5. Use Claude Code Normally
 
 ```bash
 claude "Help me refactor this function"
@@ -129,7 +151,7 @@ Avoid re-running the variable commands every time by making them permanent.
 
 ```bash
 echo 'export ANTHROPIC_BASE_URL=http://localhost:4000' >> ~/.zshrc
-echo 'export ANTHROPIC_API_KEY=placeholder'            >> ~/.zshrc
+echo 'export ANTHROPIC_API_KEY=sk-ant-placeholder'     >> ~/.zshrc
 source ~/.zshrc
 ```
 
@@ -137,7 +159,7 @@ source ~/.zshrc
 
 ```powershell
 [System.Environment]::SetEnvironmentVariable("ANTHROPIC_BASE_URL", "http://localhost:4000", "User")
-[System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY",  "placeholder",           "User")
+[System.Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY",  "sk-ant-placeholder",   "User")
 ```
 
 **Windows — System Properties GUI:**
@@ -145,7 +167,7 @@ source ~/.zshrc
 1. Open **Start** → search **"Edit environment variables for your account"**
 2. Click **New** and add each variable:
    - `ANTHROPIC_BASE_URL` = `http://localhost:4000`
-   - `ANTHROPIC_API_KEY` = `placeholder`
+   - `ANTHROPIC_API_KEY` = `sk-ant-placeholder`
 3. Click **OK** and restart your terminal
 
 ---
@@ -215,7 +237,7 @@ Claudex picks the first non-expired source automatically. If the access token ha
 | `CODEX_MODEL` | Codex model to use | `gpt-5.3-codex` |
 | `CODEX_API_ENDPOINT` | Override the Codex API endpoint | `https://chatgpt.com/backend-api/codex/responses` |
 | `ANTHROPIC_BASE_URL` | Set on the Claude Code side to point to this proxy | `http://localhost:4000` |
-| `ANTHROPIC_API_KEY` | Set on the Claude Code side (any non-empty value works) | — |
+| `ANTHROPIC_API_KEY` | Set on the Claude Code side (any `sk-ant-` prefixed value works) | — |
 
 ### Available Codex Models
 
