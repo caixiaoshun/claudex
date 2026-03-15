@@ -121,6 +121,18 @@ describe("anthropicToCodex", () => {
     assert.equal(result.stream, true);
   });
 
+  it("should always set store to false", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.store, false);
+  });
+
   it("should convert temperature and top_p", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
@@ -355,6 +367,21 @@ describe("StreamConverter", () => {
     assert.ok(events.some((e) => e.includes("content_block_stop")));
     assert.ok(events.some((e) => e.includes("message_delta")));
     assert.ok(events.some((e) => e.includes("message_stop")));
+  });
+
+  it("should not emit duplicate message_stop when finalize is called after response.completed", () => {
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022");
+    converter.processEvent("response.output_text.delta", { delta: "Hi" });
+    converter.processEvent("response.output_text.done", { text: "Hi" });
+    converter.processEvent("response.completed", {
+      status: "completed",
+      output: [],
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+
+    // finalize after response.completed should return no events
+    const events = converter.finalize();
+    assert.equal(events.length, 0);
   });
 
   it("should handle Chat Completions streaming format", () => {
