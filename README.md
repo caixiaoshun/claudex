@@ -231,7 +231,7 @@ Claudex picks the first non-expired source automatically. If the access token ha
 |---|---|---|
 | `-p, --port <port>` | Port for the proxy server | `4000` |
 | `--model <model>` | Codex model to use (e.g. `gpt-5.3-codex`) | auto-mapped |
-| `--reasoning <low\|medium\|high>` | Reasoning intensity level | auto |
+| `--reasoning <level>` | Reasoning intensity level (`low`, `medium`, or `high`) | auto |
 | `--reuse-codex` | Import credentials from an existing Codex / opencode installation | off |
 | `--list-sources` | List all detected external credential sources and exit | — |
 | `--debug` | Enable verbose debug logging | off |
