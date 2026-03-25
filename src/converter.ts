@@ -104,9 +104,16 @@ export interface AnthropicJsonSchema {
 }
 
 export interface AnthropicTool {
-  name: string;
+  name?: string;
+  type?: string;
   description?: string;
   input_schema?: AnthropicJsonSchema;
+  [key: string]: unknown;
+}
+
+export interface AnthropicToolChoice {
+  disable_parallel_tool_use?: boolean;
+  [key: string]: unknown;
 }
 
 export interface AnthropicRequest {
@@ -125,8 +132,10 @@ export interface AnthropicRequest {
   betas?: unknown;
   metadata?: unknown;
   thinking?: { type?: string; budget_tokens?: number; [key: string]: unknown };
+  output_config?: { effort?: string; [key: string]: unknown };
   stream_options?: unknown;
   max_output_tokens?: number;
+  tool_choice?: AnthropicToolChoice | string;
   [key: string]: unknown; // catch-all for any other Anthropic-specific fields
 }
 
@@ -135,11 +144,11 @@ export interface AnthropicRequest {
 // ===================================================================
 
 export interface CodexTool {
-  type: "function";
-  name: string;
-  description: string;
-  strict: true;
-  parameters: Record<string, unknown>;
+  type: "function" | "web_search";
+  name?: string;
+  description?: string;
+  strict?: boolean;
+  parameters?: Record<string, unknown>;
 }
 
 export interface CodexReasoning {
@@ -157,9 +166,14 @@ export interface CodexInputImagePart {
   image_url: string;
 }
 
+export interface CodexOutputTextPart {
+  type: "output_text";
+  text: string;
+}
+
 export type CodexMessageContent =
   | string
-  | Array<CodexInputTextPart | CodexInputImagePart>;
+  | Array<CodexInputTextPart | CodexInputImagePart | CodexOutputTextPart>;
 
 export interface CodexInputMessage {
   role: string;
@@ -177,7 +191,7 @@ export interface CodexFunctionCallInput {
 export interface CodexFunctionCallOutputInput {
   type: "function_call_output";
   call_id: string;
-  output: string;
+  output: string | Array<CodexInputTextPart | CodexInputImagePart>;
 }
 
 export type CodexInputItem =
@@ -245,6 +259,11 @@ export function mapModel(anthropicModel: string): string {
 function resolveReasoning(
   req: AnthropicRequest
 ): CodexReasoning | undefined {
+  const outputEffort =
+    typeof req.output_config?.effort === "string"
+      ? req.output_config.effort.toLowerCase()
+      : undefined;
+
   // From claudex:<model>:<reasoning> convention
   const parsed = parseClaudexModelString(req.model);
   if (parsed?.reasoning) {
@@ -270,9 +289,28 @@ function resolveReasoning(
     if (req.thinking.type === "enabled") {
       return { effort: "medium", summary: "auto" };
     }
+    if (
+      req.thinking.type === "adaptive" ||
+      req.thinking.type === "auto"
+    ) {
+      if (
+        outputEffort === "low" ||
+        outputEffort === "medium" ||
+        outputEffort === "high"
+      ) {
+        return {
+          effort: outputEffort,
+          summary: "auto",
+        };
+      }
+      return { effort: "high", summary: "auto" };
+    }
+    if (req.thinking.type === "disabled") {
+      return { effort: "low", summary: "auto" };
+    }
   }
 
-  return undefined;
+  return { effort: "medium", summary: "auto" };
 }
 
 // ===================================================================
@@ -429,8 +467,13 @@ function mergeRequiredKeys(
   return merged;
 }
 
+interface NormalizeSchemaOptions {
+  enforceObjectConstraints: boolean;
+}
+
 function normalizeSchemaMap(
-  value: unknown
+  value: unknown,
+  options: NormalizeSchemaOptions
 ): Record<string, unknown> | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -438,30 +481,59 @@ function normalizeSchemaMap(
 
   const normalized: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    normalized[key] = normalizeSchema(child);
+    normalized[key] = normalizeSchemaInternal(child, options);
   }
   return normalized;
 }
 
-function normalizeNestedSchemaValue(key: string, value: unknown): unknown {
+function filterRequiredKeys(
+  required: unknown,
+  properties: Record<string, unknown>
+): string[] | undefined {
+  if (!Array.isArray(required)) {
+    return undefined;
+  }
+
+  const allowed = new Set(Object.keys(properties));
+  const filtered: string[] = [];
+  for (const entry of required) {
+    if (
+      typeof entry === "string" &&
+      allowed.has(entry) &&
+      !filtered.includes(entry)
+    ) {
+      filtered.push(entry);
+    }
+  }
+
+  return filtered.length > 0 ? filtered : undefined;
+}
+
+function normalizeNestedSchemaValue(
+  key: string,
+  value: unknown,
+  options: NormalizeSchemaOptions
+): unknown {
   if (SCHEMA_MAP_KEYWORDS.has(key)) {
-    return normalizeSchemaMap(value);
+    return normalizeSchemaMap(value, options);
   }
 
   if (SCHEMA_ARRAY_KEYWORDS.has(key)) {
     return Array.isArray(value)
-      ? value.map((item) => normalizeSchema(item))
+      ? value.map((item) => normalizeSchemaInternal(item, options))
       : undefined;
   }
 
   if (SCHEMA_KEYWORDS.has(key)) {
     if (Array.isArray(value)) {
-      return value.map((item) => normalizeSchema(item));
+      return value.map((item) => normalizeSchemaInternal(item, options));
     }
     if (typeof value === "boolean") {
       return value;
     }
-    return isRecord(value) ? normalizeSchema(value) : undefined;
+    return isRecord(value)
+      ? normalizeSchemaInternal(value, options)
+      : undefined;
   }
 
   return value;
@@ -487,19 +559,22 @@ function inferType(normalized: Record<string, unknown>): string {
  *  5. Drop all non-whitelisted fields, including rejected combinators such
  *     as `oneOf` / `allOf`.
  */
-export function normalizeSchema(node: unknown): unknown {
+function normalizeSchemaInternal(
+  node: unknown,
+  options: NormalizeSchemaOptions
+): unknown {
   if (node === null || node === undefined || typeof node !== "object") {
     return node;
   }
   if (Array.isArray(node)) {
-    return node.map((item) => normalizeSchema(item));
+    return node.map((item) => normalizeSchemaInternal(item, options));
   }
 
   const source = node as Record<string, unknown>;
   const normalizedChildren: Record<string, unknown> = {};
 
   for (const [key, rawValue] of Object.entries(source)) {
-    const value = normalizeNestedSchemaValue(key, rawValue);
+    const value = normalizeNestedSchemaValue(key, rawValue, options);
     if (value !== undefined) {
       normalizedChildren[key] = value;
     }
@@ -513,14 +588,27 @@ export function normalizeSchema(node: unknown): unknown {
   const normalizedProperties = withType.properties;
   let withRequired = withType;
   if (isRecord(normalizedProperties)) {
-    withRequired = {
-      ...withType,
-      required: mergeRequiredKeys(withType.required, normalizedProperties),
-    };
+    if (options.enforceObjectConstraints) {
+      withRequired = {
+        ...withType,
+        required: mergeRequiredKeys(withType.required, normalizedProperties),
+      };
+    } else {
+      const filteredRequired = filterRequiredKeys(
+        withType.required,
+        normalizedProperties
+      );
+      withRequired =
+        filteredRequired !== undefined
+          ? { ...withType, required: filteredRequired }
+          : { ...withType };
+    }
   }
 
   const withAdditionalProperties =
-    withRequired.type === "object" && !isPureRecordContainer(withRequired)
+    options.enforceObjectConstraints &&
+    withRequired.type === "object" &&
+    !isPureRecordContainer(withRequired)
       ? { ...withRequired, additionalProperties: false }
       : withRequired;
 
@@ -537,8 +625,26 @@ export function normalizeSchema(node: unknown): unknown {
   return normalized;
 }
 
+export function normalizeSchema(node: unknown): unknown {
+  return normalizeSchemaInternal(node, {
+    enforceObjectConstraints: false,
+  });
+}
+
 /** @deprecated Use normalizeSchema instead. Kept for compatibility with existing callers/tests. */
 export const sanitizeToolSchema = normalizeSchema;
+
+function normalizeToolParameters(rawSchema: unknown): Record<string, unknown> {
+  const normalized = normalizeSchema(rawSchema);
+  const parameters = isRecord(normalized) ? { ...normalized } : {};
+
+  parameters.type = "object";
+  if (!isRecord(parameters.properties)) {
+    parameters.properties = {};
+  }
+
+  return parameters;
+}
 
 function normalizeCodexRequestBody(req: CodexRequest): CodexRequest {
   const normalized: Record<string, unknown> = {};
@@ -550,38 +656,172 @@ function normalizeCodexRequestBody(req: CodexRequest): CodexRequest {
   return normalized as unknown as CodexRequest;
 }
 
+const MAX_CODEX_TOOL_NAME_LENGTH = 64;
+const BILLING_HEADER_PREFIX = "x-anthropic-billing-header:";
+const CLAUDE_TOOL_ID_PATTERN = /[^a-zA-Z0-9_-]/g;
+
+function shortenToolNameIfNeeded(name: string): string {
+  if (name.length <= MAX_CODEX_TOOL_NAME_LENGTH) {
+    return name;
+  }
+
+  if (name.startsWith("mcp__")) {
+    const lastSeparator = name.lastIndexOf("__");
+    if (lastSeparator > 0) {
+      const candidate = `mcp__${name.slice(lastSeparator + 2)}`;
+      return candidate.slice(0, MAX_CODEX_TOOL_NAME_LENGTH);
+    }
+  }
+
+  return name.slice(0, MAX_CODEX_TOOL_NAME_LENGTH);
+}
+
+function buildToolNameMap(
+  tools: AnthropicTool[] | undefined
+): Map<string, string> {
+  const map = new Map<string, string>();
+  const used = new Set<string>();
+
+  const makeUnique = (candidate: string): string => {
+    if (!used.has(candidate)) {
+      return candidate;
+    }
+
+    const base = candidate;
+    for (let i = 1; ; i += 1) {
+      const suffix = `_${i}`;
+      const allowedBaseLength = Math.max(
+        0,
+        MAX_CODEX_TOOL_NAME_LENGTH - suffix.length
+      );
+      const unique = `${base.slice(0, allowedBaseLength)}${suffix}`;
+      if (!used.has(unique)) {
+        return unique;
+      }
+    }
+  };
+
+  for (const tool of tools ?? []) {
+    if (typeof tool.name !== "string" || tool.name.length === 0) {
+      continue;
+    }
+
+    const shortened = shortenToolNameIfNeeded(tool.name);
+    const unique = makeUnique(shortened);
+    used.add(unique);
+    map.set(tool.name, unique);
+  }
+
+  return map;
+}
+
+function restoreOriginalToolName(
+  name: string,
+  originalTools?: AnthropicTool[]
+): string {
+  if (!originalTools?.length) {
+    return name;
+  }
+
+  const reverse = new Map<string, string>();
+  for (const [original, shortened] of buildToolNameMap(originalTools)) {
+    reverse.set(shortened, original);
+  }
+
+  return reverse.get(name) ?? name;
+}
+
+function sanitizeToolUseId(id: string | undefined): string {
+  const sanitized = (id || "").replace(CLAUDE_TOOL_ID_PATTERN, "_");
+  return sanitized || `toolu_${crypto.randomUUID()}`;
+}
+
+function extractUsage(
+  usage: Record<string, unknown> | undefined
+): {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+} {
+  const rawInput =
+    typeof usage?.input_tokens === "number" ? usage.input_tokens : 0;
+  const outputTokens =
+    typeof usage?.output_tokens === "number" ? usage.output_tokens : 0;
+  const inputTokenDetails = isRecord(usage?.input_tokens_details)
+    ? usage.input_tokens_details
+    : undefined;
+  const cachedTokens =
+    typeof inputTokenDetails?.cached_tokens === "number"
+      ? inputTokenDetails.cached_tokens
+      : undefined;
+  const cacheReadInputTokens =
+    typeof cachedTokens === "number" && cachedTokens > 0
+      ? cachedTokens
+      : undefined;
+  const inputTokens = Math.max(
+    0,
+    rawInput - (cacheReadInputTokens ?? 0)
+  );
+
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    ...(cacheReadInputTokens
+      ? { cache_read_input_tokens: cacheReadInputTokens }
+      : {}),
+  };
+}
+
+function extractReasoningText(item: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const appendText = (value: unknown): void => {
+    if (typeof value === "string" && value) {
+      parts.push(value);
+    } else if (Array.isArray(value)) {
+      for (const entry of value) {
+        if (isRecord(entry) && typeof entry.text === "string" && entry.text) {
+          parts.push(entry.text);
+        } else if (typeof entry === "string" && entry) {
+          parts.push(entry);
+        }
+      }
+    }
+  };
+
+  appendText(item.summary);
+  if (parts.length === 0) {
+    appendText(item.content);
+  }
+
+  return parts.join("");
+}
+
 /**
  * Convert an Anthropic tool definition to a Codex Responses API tool.
  * The Codex API requires:
- * - flat format: { type: "function", name, description, strict: true, parameters }
- * - `required` must match the backend-recognized required property set
- * - `additionalProperties` must be false
- * - `strict` must be true
+ * - flat format: { type: "function", name, description, strict: false, parameters }
+ * - top-level parameters must be an object schema
  * - Only whitelisted JSON Schema keywords in parameter schemas
  */
-function convertTool(tool: AnthropicTool): CodexTool {
-  const rawSchema = tool.input_schema || {};
-  const normalizedSchema = normalizeSchema(rawSchema);
-  const parameters = isRecord(normalizedSchema)
-    ? { ...normalizedSchema }
-    : {};
-
-  if (!isRecord(parameters.properties)) {
-    parameters.properties = {};
+function convertTool(
+  tool: AnthropicTool,
+  toolNameMap: Map<string, string>
+): CodexTool | null {
+  if (tool.type === "web_search_20250305") {
+    return { type: "web_search" };
   }
 
-  parameters.type = "object";
-  parameters.required = mergeRequiredKeys(
-    parameters.required,
-    parameters.properties as Record<string, unknown>
-  );
-  parameters.additionalProperties = false;
+  if (typeof tool.name !== "string" || tool.name.length === 0) {
+    return null;
+  }
+
+  const parameters = normalizeToolParameters(tool.input_schema || {});
 
   return {
     type: "function",
-    name: tool.name,
+    name: toolNameMap.get(tool.name) ?? shortenToolNameIfNeeded(tool.name),
     description: tool.description || "",
-    strict: true,
+    strict: false,
     parameters,
   };
 }
@@ -591,35 +831,97 @@ function convertTool(tool: AnthropicTool): CodexTool {
 // ===================================================================
 
 function convertMessages(
-  messages: AnthropicMessage[]
+  messages: AnthropicMessage[],
+  toolNameMap: Map<string, string>
 ): CodexInputItem[] {
   const result: CodexInputItem[] = [];
 
   for (const msg of messages) {
     if (typeof msg.content === "string") {
-      result.push({ role: msg.role, content: msg.content });
+      if (msg.content.length === 0) {
+        continue;
+      }
+
+      if (msg.role === "assistant") {
+        result.push({
+          role: "assistant",
+          content: [{ type: "output_text", text: msg.content }],
+        });
+      } else {
+        result.push({ role: msg.role, content: msg.content });
+      }
       continue;
     }
 
-    // Array content blocks
-    const blocks = msg.content;
-    const textParts: string[] = [];
-    const imageParts: CodexInputImagePart[] = [];
-    const functionCalls: CodexFunctionCallInput[] = [];
-    const functionOutputs: CodexFunctionCallOutputInput[] = [];
+    const assistantParts: CodexOutputTextPart[] = [];
+    const userParts: Array<CodexInputTextPart | CodexInputImagePart> = [];
 
-    for (const block of blocks) {
+    const flushMessage = (): void => {
+      if (msg.role === "assistant") {
+        if (assistantParts.length === 0) {
+          return;
+        }
+        result.push({
+          role: "assistant",
+          content: [...assistantParts],
+        });
+        assistantParts.length = 0;
+        return;
+      }
+
+      if (userParts.length === 0) {
+        return;
+      }
+
+      result.push({
+        role: "user",
+        content: buildOrderedUserMessageContent(userParts),
+      });
+      userParts.length = 0;
+    };
+
+    const appendText = (text: string): void => {
+      if (text.length === 0) {
+        return;
+      }
+
+      if (msg.role === "assistant") {
+        assistantParts.push({ type: "output_text", text });
+      } else {
+        userParts.push({ type: "input_text", text });
+      }
+    };
+
+    const appendImage = (block: AnthropicImageContent): void => {
+      const imagePart = convertImageBlock(block);
+      if (msg.role === "user" && imagePart) {
+        userParts.push(imagePart);
+        return;
+      }
+
+      if (block.source.url) {
+        appendText(`[Image: ${block.source.url}]`);
+      }
+    };
+
+    for (const block of msg.content) {
       switch (block.type) {
         case "text":
-          textParts.push(block.text);
+          appendText(block.text);
           break;
 
         case "tool_use": {
+          if (msg.role !== "assistant") {
+            break;
+          }
+
+          flushMessage();
           const callId = block.id || `call_${crypto.randomUUID()}`;
-          functionCalls.push({
+          result.push({
             type: "function_call",
             call_id: callId,
-            name: block.name,
+            name:
+              toolNameMap.get(block.name) ?? shortenToolNameIfNeeded(block.name),
             arguments:
               typeof block.input === "string"
                 ? block.input
@@ -629,20 +931,34 @@ function convertMessages(
         }
 
         case "tool_result": {
-          let output: string;
+          if (msg.role !== "user") {
+            break;
+          }
+
+          flushMessage();
+          let output: string | Array<CodexInputTextPart | CodexInputImagePart>;
           if (typeof block.content === "string") {
             output = block.content;
           } else if (Array.isArray(block.content)) {
-            output = block.content
-              .filter(
-                (b): b is AnthropicTextContent => b.type === "text"
-              )
-              .map((b) => b.text)
-              .join("\n");
+            const parts: Array<CodexInputTextPart | CodexInputImagePart> = [];
+            for (const toolResultBlock of block.content) {
+              if (toolResultBlock.type === "text") {
+                parts.push({
+                  type: "input_text",
+                  text: toolResultBlock.text,
+                });
+              } else if (toolResultBlock.type === "image") {
+                const imagePart = convertImageBlock(toolResultBlock);
+                if (imagePart) {
+                  parts.push(imagePart);
+                }
+              }
+            }
+            output = parts.length > 0 ? parts : "";
           } else {
             output = "";
           }
-          functionOutputs.push({
+          result.push({
             type: "function_call_output",
             call_id: block.tool_use_id,
             output,
@@ -650,51 +966,13 @@ function convertMessages(
           break;
         }
 
-        case "image": {
-          const imagePart = convertImageBlock(block);
-          if (msg.role === "user" && imagePart) {
-            imageParts.push(imagePart);
-          } else if (block.source.url) {
-            textParts.push(`[Image: ${block.source.url}]`);
-          }
+        case "image":
+          appendImage(block);
           break;
-        }
       }
     }
 
-    // Emit assistant messages
-    if (msg.role === "assistant") {
-      if (textParts.length > 0) {
-        result.push({
-          role: "assistant",
-          content: textParts.join("\n"),
-        });
-      }
-
-      for (const fc of functionCalls) {
-        result.push(fc);
-      }
-    }
-
-    // Emit user messages
-    if (msg.role === "user") {
-      if (functionOutputs.length > 0) {
-        for (const fo of functionOutputs) {
-          result.push(fo);
-        }
-        if (textParts.length > 0 || imageParts.length > 0) {
-          result.push({
-            role: "user",
-            content: buildUserMessageContent(textParts, imageParts),
-          });
-        }
-      } else {
-        result.push({
-          role: "user",
-          content: buildUserMessageContent(textParts, imageParts),
-        });
-      }
-    }
+    flushMessage();
   }
 
   return result;
@@ -720,37 +998,53 @@ function convertImageBlock(
   return null;
 }
 
-function buildUserMessageContent(
-  textParts: string[],
-  imageParts: CodexInputImagePart[]
+function buildOrderedUserMessageContent(
+  parts: Array<CodexInputTextPart | CodexInputImagePart>
 ): CodexMessageContent {
-  if (imageParts.length === 0) {
-    return textParts.length > 0 ? textParts.join("\n") : "";
+  if (parts.length === 0) {
+    return "";
   }
 
-  const content: Array<CodexInputTextPart | CodexInputImagePart> = [];
-  const text = textParts.join("\n");
-  if (text) {
-    content.push({
-      type: "input_text",
-      text,
-    });
+  if (parts.every((part) => part.type === "input_text")) {
+    return parts.map((part) => part.text).join("\n");
   }
-  content.push(...imageParts);
-  return content;
+
+  return [...parts];
 }
 
-/** Extract system prompt/instructions from Anthropic request. */
-function extractInstructions(req: AnthropicRequest): string {
-  if (!req.system) return "";
-  if (typeof req.system === "string") return req.system;
+function extractSystemTexts(req: AnthropicRequest): string[] {
+  if (!req.system) return [];
+  if (typeof req.system === "string") {
+    return req.system.startsWith(BILLING_HEADER_PREFIX) ? [] : [req.system];
+  }
   if (Array.isArray(req.system)) {
     return req.system
-      .filter((s) => s.type === "text" && s.text)
-      .map((s) => s.text)
-      .join("\n");
+      .filter(
+        (s) =>
+          s.type === "text" &&
+          s.text &&
+          !s.text.startsWith(BILLING_HEADER_PREFIX)
+      )
+      .map((s) => s.text);
   }
-  return "";
+  return [];
+}
+
+function buildDeveloperMessage(
+  req: AnthropicRequest
+): CodexInputMessage | null {
+  const systemTexts = extractSystemTexts(req);
+  if (systemTexts.length === 0) {
+    return null;
+  }
+
+  return {
+    role: "developer",
+    content: systemTexts.map((text) => ({
+      type: "input_text",
+      text,
+    })),
+  };
 }
 
 // ===================================================================
@@ -763,17 +1057,27 @@ function extractInstructions(req: AnthropicRequest): string {
  */
 export function anthropicToCodex(req: AnthropicRequest): CodexRequest {
   const model = mapModel(req.model);
-  const instructions = extractInstructions(req);
-  const input = convertMessages(req.messages);
+  const toolNameMap = buildToolNameMap(req.tools);
+  const input = convertMessages(req.messages, toolNameMap);
+  const developerMessage = buildDeveloperMessage(req);
   const reasoning = resolveReasoning(req);
+  const parallelToolCalls = !(
+    isRecord(req.tool_choice) &&
+    req.tool_choice.disable_parallel_tool_use === true
+  );
+
+  if (developerMessage) {
+    input.unshift(developerMessage);
+  }
 
   const result: CodexRequest = {
     model,
-    instructions,
+    instructions: "",
     input,
+    parallel_tool_calls: parallelToolCalls,
     store: false,
     stream: req.stream === true,
-    include: [],
+    include: ["reasoning.encrypted_content"],
   };
 
   if (reasoning) {
@@ -782,9 +1086,13 @@ export function anthropicToCodex(req: AnthropicRequest): CodexRequest {
 
   // Tools
   if (req.tools && req.tools.length > 0) {
-    result.tools = req.tools.map(convertTool);
-    result.tool_choice = "auto";
-    result.parallel_tool_calls = true;
+    const convertedTools = req.tools
+      .map((tool) => convertTool(tool, toolNameMap))
+      .filter((tool): tool is CodexTool => tool !== null);
+    if (convertedTools.length > 0) {
+      result.tools = convertedTools;
+      result.tool_choice = "auto";
+    }
   }
 
   return normalizeCodexRequestBody(result);
@@ -800,6 +1108,7 @@ interface AnthropicResponse {
   role: "assistant";
   content: Array<
     | { type: "text"; text: string }
+    | { type: "thinking"; thinking: string }
     | {
         type: "tool_use";
         id: string;
@@ -810,16 +1119,21 @@ interface AnthropicResponse {
   model: string;
   stop_reason: "end_turn" | "max_tokens" | "tool_use" | "stop_sequence" | null;
   stop_sequence: string | null;
-  usage: { input_tokens: number; output_tokens: number };
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
 export function codexToAnthropic(
   codexRes: Record<string, unknown>,
-  requestModel: string
+  requestModel: string,
+  originalTools?: AnthropicTool[]
 ): AnthropicResponse {
   // Responses API format: has `output` array
   if (codexRes.output && Array.isArray(codexRes.output)) {
-    return convertResponsesFormat(codexRes, requestModel);
+    return convertResponsesFormat(codexRes, requestModel, originalTools);
   }
 
   // Chat Completions fallback: has `choices` array
@@ -842,14 +1156,20 @@ export function codexToAnthropic(
 
 function convertResponsesFormat(
   codexRes: Record<string, unknown>,
-  requestModel: string
+  requestModel: string,
+  originalTools?: AnthropicTool[]
 ): AnthropicResponse {
   const output = codexRes.output as Array<Record<string, unknown>>;
   const content: AnthropicResponse["content"] = [];
   let hasToolUse = false;
 
   for (const item of output) {
-    if (item.type === "message") {
+    if (item.type === "reasoning") {
+      const thinking = extractReasoningText(item);
+      if (thinking) {
+        content.push({ type: "thinking", thinking });
+      }
+    } else if (item.type === "message") {
       const msgContent = item.content as
         | Array<Record<string, unknown>>
         | undefined;
@@ -873,11 +1193,15 @@ function convertResponsesFormat(
       }
       content.push({
         type: "tool_use",
-        id:
+        id: sanitizeToolUseId(
           (item.call_id as string) ||
-          (item.id as string) ||
-          `toolu_${crypto.randomUUID()}`,
-        name: (item.name as string) || "unknown",
+            (item.id as string) ||
+            `toolu_${crypto.randomUUID()}`
+        ),
+        name: restoreOriginalToolName(
+          (item.name as string) || "unknown",
+          originalTools
+        ),
         input,
       });
     }
@@ -887,11 +1211,19 @@ function convertResponsesFormat(
     content.push({ type: "text", text: "" });
   }
 
-  const usage = codexRes.usage as Record<string, number> | undefined;
+  const usage = extractUsage(
+    codexRes.usage as Record<string, unknown> | undefined
+  );
   const status = codexRes.status as string | undefined;
+  const stopReasonFromResponse =
+    typeof codexRes.stop_reason === "string" ? codexRes.stop_reason : null;
 
   let stopReason: AnthropicResponse["stop_reason"] = "end_turn";
   if (hasToolUse) stopReason = "tool_use";
+  else if (stopReasonFromResponse === "max_tokens")
+    stopReason = "max_tokens";
+  else if (stopReasonFromResponse === "stop_sequence")
+    stopReason = "stop_sequence";
   else if (status === "incomplete") stopReason = "max_tokens";
 
   return {
@@ -902,10 +1234,7 @@ function convertResponsesFormat(
     model: requestModel,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: {
-      input_tokens: usage?.input_tokens ?? 0,
-      output_tokens: usage?.output_tokens ?? 0,
-    },
+    usage,
   };
 }
 
@@ -968,16 +1297,29 @@ function convertChatCompletionsFormat(
  */
 export class StreamConverter {
   private model: string;
+  private originalTools?: AnthropicTool[];
   private started = false;
   private finished = false;
   private blockIndex = 0;
-  private blockOpen = false;
+  private openBlockType: "text" | "thinking" | null = null;
   private inputTokens = 0;
   private outputTokens = 0;
   private outputChars = 0;
+  private cacheReadInputTokens = 0;
+  private toolCallSeen = false;
+  private messageId = `msg_${crypto.randomUUID()}`;
+  private pendingToolCall: {
+    itemId?: string;
+    outputIndex?: number;
+    toolId: string;
+    name: string;
+    argumentsBuffer: string;
+    emittedArgumentsDelta: boolean;
+  } | null = null;
 
-  constructor(model: string) {
+  constructor(model: string, originalTools?: AnthropicTool[]) {
     this.model = model;
+    this.originalTools = originalTools;
   }
 
   /** Build an Anthropic SSE event string. */
@@ -986,18 +1328,22 @@ export class StreamConverter {
   }
 
   /** Emit message_start + ping on the first event. */
-  private ensureStarted(): string[] {
+  private ensureStarted(response?: Record<string, unknown>): string[] {
     if (this.started) return [];
     this.started = true;
+    const responseId =
+      typeof response?.id === "string" ? response.id : this.messageId;
+    const responseModel =
+      typeof response?.model === "string" ? response.model : this.model;
     return [
       this.sse("message_start", {
         type: "message_start",
         message: {
-          id: `msg_${crypto.randomUUID()}`,
+          id: responseId,
           type: "message",
           role: "assistant",
           content: [],
-          model: this.model,
+          model: responseModel,
           stop_reason: null,
           stop_sequence: null,
           usage: { input_tokens: 0, output_tokens: 0 },
@@ -1007,21 +1353,31 @@ export class StreamConverter {
     ];
   }
 
-  private ensureBlockOpen(): string[] {
-    if (this.blockOpen) return [];
-    this.blockOpen = true;
+  private startBlock(type: "text" | "thinking"): string[] {
+    const events: string[] = [];
+    if (this.openBlockType === type) {
+      return events;
+    }
+
+    events.push(...this.closeOpenBlock());
+    this.openBlockType = type;
     return [
+      ...events,
       this.sse("content_block_start", {
         type: "content_block_start",
         index: this.blockIndex,
-        content_block: { type: "text", text: "" },
+        content_block:
+          type === "thinking"
+            ? { type: "thinking", thinking: "" }
+            : { type: "text", text: "" },
       }),
     ];
   }
 
-  private closeBlock(): string[] {
-    if (!this.blockOpen) return [];
-    this.blockOpen = false;
+  private closeOpenBlock(expected?: "text" | "thinking"): string[] {
+    if (!this.openBlockType) return [];
+    if (expected && this.openBlockType !== expected) return [];
+    this.openBlockType = null;
     const events = [
       this.sse("content_block_stop", {
         type: "content_block_stop",
@@ -1032,23 +1388,140 @@ export class StreamConverter {
     return events;
   }
 
+  private startToolCall(
+    item: Record<string, unknown>,
+    emitEmptyDelta: boolean
+  ): string[] {
+    const rawId =
+      (item.call_id as string) ||
+      (item.id as string) ||
+      `toolu_${crypto.randomUUID()}`;
+    const toolId = sanitizeToolUseId(rawId);
+    const name = restoreOriginalToolName(
+      (item.name as string) || "unknown",
+      this.originalTools
+    );
+
+    this.pendingToolCall = {
+      itemId: typeof item.id === "string" ? item.id : undefined,
+      outputIndex:
+        typeof item.output_index === "number" ? item.output_index : undefined,
+      toolId,
+      name,
+      argumentsBuffer:
+        typeof item.arguments === "string" ? item.arguments : "",
+      emittedArgumentsDelta: false,
+    };
+    this.toolCallSeen = true;
+
+    const events = [
+      ...this.closeOpenBlock(),
+      this.sse("content_block_start", {
+        type: "content_block_start",
+        index: this.blockIndex,
+        content_block: {
+          type: "tool_use",
+          id: toolId,
+          name,
+          input: {},
+        },
+      }),
+    ];
+
+    if (emitEmptyDelta) {
+      events.push(this.emitToolArgumentDelta(""));
+    }
+
+    return events;
+  }
+
+  private emitToolArgumentDelta(partialJson: string): string {
+    if (this.pendingToolCall) {
+      this.pendingToolCall.emittedArgumentsDelta = true;
+      this.pendingToolCall.argumentsBuffer += partialJson;
+    }
+
+    return this.sse("content_block_delta", {
+      type: "content_block_delta",
+      index: this.blockIndex,
+      delta: {
+        type: "input_json_delta",
+        partial_json: partialJson,
+      },
+    });
+  }
+
+  private finishToolCall(): string[] {
+    if (!this.pendingToolCall) {
+      return [];
+    }
+
+    this.pendingToolCall = null;
+    const events = [
+      this.sse("content_block_stop", {
+        type: "content_block_stop",
+        index: this.blockIndex,
+      }),
+    ];
+    this.blockIndex += 1;
+    return events;
+  }
+
+  private matchesPendingToolCall(data: Record<string, unknown>): boolean {
+    if (!this.pendingToolCall) {
+      return false;
+    }
+
+    const itemId = typeof data.item_id === "string" ? data.item_id : undefined;
+    const outputIndex =
+      typeof data.output_index === "number" ? data.output_index : undefined;
+
+    if (
+      itemId &&
+      this.pendingToolCall.itemId &&
+      itemId === this.pendingToolCall.itemId
+    ) {
+      return true;
+    }
+
+    if (
+      outputIndex !== undefined &&
+      this.pendingToolCall.outputIndex !== undefined &&
+      outputIndex === this.pendingToolCall.outputIndex
+    ) {
+      return true;
+    }
+
+    return !itemId && outputIndex === undefined;
+  }
+
   private emitFinish(
     stopReason: string,
-    inputTokens?: number,
-    outputTokens?: number
+    usage?: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens?: number;
+    }
   ): string[] {
     if (this.finished) return [];
     this.finished = true;
 
-    const iTokens = inputTokens ?? this.inputTokens;
-    const oTokens =
-      outputTokens ?? Math.max(this.outputTokens, Math.ceil(this.outputChars / 4));
+    const usagePayload = usage ?? {
+      input_tokens: this.inputTokens,
+      output_tokens: Math.max(
+        this.outputTokens,
+        Math.ceil(this.outputChars / 4)
+      ),
+      ...(this.cacheReadInputTokens > 0
+        ? { cache_read_input_tokens: this.cacheReadInputTokens }
+        : {}),
+    };
 
     return [
       this.sse("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: oTokens },
+        usage: usagePayload,
       }),
       this.sse("message_stop", { type: "message_stop" }),
     ];
@@ -1073,13 +1546,26 @@ export class StreamConverter {
     }
 
     switch (eventType) {
-      case "response.created":
-        events.push(...this.ensureStarted());
+      case "response.created": {
+        const response = isRecord(data.response)
+          ? (data.response as Record<string, unknown>)
+          : undefined;
+        events.push(...this.ensureStarted(response));
         break;
+      }
+
+      case "response.content_part.added": {
+        events.push(...this.ensureStarted());
+        const part = isRecord(data.part) ? data.part : undefined;
+        if (part?.type === "output_text") {
+          events.push(...this.startBlock("text"));
+        }
+        break;
+      }
 
       case "response.output_text.delta": {
         events.push(...this.ensureStarted());
-        events.push(...this.ensureBlockOpen());
+        events.push(...this.startBlock("text"));
         const delta =
           typeof data.delta === "string" ? data.delta : "";
         if (delta) {
@@ -1097,108 +1583,134 @@ export class StreamConverter {
 
       case "response.output_text.done":
         events.push(...this.ensureStarted());
-        events.push(...this.closeBlock());
+        events.push(...this.closeOpenBlock("text"));
         break;
 
-      case "response.output_item.added":
+      case "response.content_part.done":
         events.push(...this.ensureStarted());
+        events.push(...this.closeOpenBlock("text"));
         break;
+
+      case "response.output_item.added": {
+        events.push(...this.ensureStarted());
+        const item =
+          (data.item as Record<string, unknown>) ?? data;
+        if (item.type === "function_call") {
+          events.push(...this.startToolCall(item, true));
+        }
+        break;
+      }
+
+      case "response.function_call_arguments.delta": {
+        events.push(...this.ensureStarted());
+        if (this.pendingToolCall && this.matchesPendingToolCall(data)) {
+          const delta =
+            typeof data.delta === "string" ? data.delta : "";
+          events.push(this.emitToolArgumentDelta(delta));
+        }
+        break;
+      }
+
+      case "response.function_call_arguments.done": {
+        events.push(...this.ensureStarted());
+        if (this.pendingToolCall && this.matchesPendingToolCall(data)) {
+          const argumentsText =
+            typeof data.arguments === "string" ? data.arguments : "";
+          if (
+            !this.pendingToolCall.emittedArgumentsDelta &&
+            argumentsText
+          ) {
+            events.push(this.emitToolArgumentDelta(argumentsText));
+          } else if (argumentsText) {
+            this.pendingToolCall.argumentsBuffer = argumentsText;
+          }
+        }
+        break;
+      }
 
       case "response.output_item.done": {
         events.push(...this.ensureStarted());
         const item =
           (data.item as Record<string, unknown>) ?? data;
         if (item.type === "function_call") {
-          // Close any open text block first
-          events.push(...this.closeBlock());
-
-          let input: Record<string, unknown> = {};
-          try {
-            input =
-              typeof item.arguments === "string"
-                ? JSON.parse(item.arguments as string)
-                : (item.arguments as Record<string, unknown>) || {};
-          } catch {
-            input = {};
+          if (!this.pendingToolCall) {
+            events.push(...this.startToolCall(item, false));
           }
 
-          const toolId =
-            (item.call_id as string) ||
-            (item.id as string) ||
-            `toolu_${crypto.randomUUID()}`;
+          if (this.pendingToolCall) {
+            const fullArguments =
+              typeof item.arguments === "string"
+                ? item.arguments
+                : this.pendingToolCall.argumentsBuffer;
+            if (
+              !this.pendingToolCall.emittedArgumentsDelta &&
+              fullArguments
+            ) {
+              events.push(this.emitToolArgumentDelta(fullArguments));
+            }
+          }
 
-          events.push(
-            this.sse("content_block_start", {
-              type: "content_block_start",
-              index: this.blockIndex,
-              content_block: {
-                type: "tool_use",
-                id: toolId,
-                name: (item.name as string) || "unknown",
-                input,
-              },
-            })
-          );
-          events.push(
-            this.sse("content_block_delta", {
-              type: "content_block_delta",
-              index: this.blockIndex,
-              delta: {
-                type: "input_json_delta",
-                partial_json: JSON.stringify(input),
-              },
-            })
-          );
-          events.push(
-            this.sse("content_block_stop", {
-              type: "content_block_stop",
-              index: this.blockIndex,
-            })
-          );
-          this.blockIndex++;
+          events.push(...this.finishToolCall());
         }
         break;
       }
 
       case "response.completed": {
-        events.push(...this.ensureStarted());
-        events.push(...this.closeBlock());
-
-        let iTokens = 0;
-        let oTokens = 0;
-        const usage = (
-          data.response
-            ? (data.response as Record<string, unknown>).usage
-            : data.usage
-        ) as Record<string, number> | undefined;
-        if (usage) {
-          iTokens = usage.input_tokens ?? 0;
-          oTokens = usage.output_tokens ?? 0;
-          this.inputTokens = iTokens;
-          this.outputTokens = oTokens;
+        const response = isRecord(data.response)
+          ? (data.response as Record<string, unknown>)
+          : undefined;
+        events.push(...this.ensureStarted(response));
+        events.push(...this.closeOpenBlock());
+        if (this.pendingToolCall) {
+          if (
+            !this.pendingToolCall.emittedArgumentsDelta &&
+            this.pendingToolCall.argumentsBuffer
+          ) {
+            events.push(
+              this.emitToolArgumentDelta(this.pendingToolCall.argumentsBuffer)
+            );
+          }
+          events.push(...this.finishToolCall());
         }
+
+        const usage = extractUsage(
+          isRecord(response?.usage)
+            ? (response.usage as Record<string, unknown>)
+            : (data.usage as Record<string, unknown> | undefined)
+        );
+        this.inputTokens = usage.input_tokens;
+        this.outputTokens = usage.output_tokens;
+        this.cacheReadInputTokens = usage.cache_read_input_tokens ?? 0;
 
         // Determine stop reason
         const output = (
-          data.response
-            ? (data.response as Record<string, unknown>).output
+          response
+            ? response.output
             : data.output
         ) as Array<Record<string, unknown>> | undefined;
         let stopReason = "end_turn";
-        if (output) {
-          const hasToolUse = output.some(
-            (o) => o.type === "function_call"
-          );
-          if (hasToolUse) stopReason = "tool_use";
+        const responseStopReason =
+          typeof response?.stop_reason === "string"
+            ? response.stop_reason
+            : undefined;
+        if (
+          this.toolCallSeen ||
+          output?.some((item) => item.type === "function_call")
+        ) {
+          stopReason = "tool_use";
+        } else if (responseStopReason === "max_tokens") {
+          stopReason = "max_tokens";
+        } else if (responseStopReason === "stop_sequence") {
+          stopReason = "stop_sequence";
         }
 
-        events.push(...this.emitFinish(stopReason, iTokens, oTokens));
+        events.push(...this.emitFinish(stopReason, usage));
         break;
       }
 
       case "response.failed": {
         events.push(...this.ensureStarted());
-        events.push(...this.closeBlock());
+        events.push(...this.closeOpenBlock());
 
         let errorMsg = "Unknown error";
         const resp = data.response as
@@ -1224,16 +1736,38 @@ export class StreamConverter {
 
       case "response.incomplete": {
         events.push(...this.ensureStarted());
-        events.push(...this.closeBlock());
+        events.push(...this.closeOpenBlock());
         events.push(...this.emitFinish("max_tokens"));
         break;
       }
 
       // Reasoning events — silently consume (no Anthropic equivalent)
-      case "response.reasoning_summary_text.delta":
-      case "response.reasoning_text.delta":
       case "response.reasoning_summary_part.added":
         events.push(...this.ensureStarted());
+        events.push(...this.startBlock("thinking"));
+        break;
+
+      case "response.reasoning_summary_text.delta":
+      case "response.reasoning_text.delta":
+        events.push(...this.ensureStarted());
+        events.push(...this.startBlock("thinking"));
+        if (typeof data.delta === "string" && data.delta) {
+          events.push(
+            this.sse("content_block_delta", {
+              type: "content_block_delta",
+              index: this.blockIndex,
+              delta: {
+                type: "thinking_delta",
+                thinking: data.delta,
+              },
+            })
+          );
+        }
+        break;
+
+      case "response.reasoning_summary_part.done":
+        events.push(...this.ensureStarted());
+        events.push(...this.closeOpenBlock("thinking"));
         break;
 
       default:
@@ -1257,7 +1791,7 @@ export class StreamConverter {
       const choice = choices[0];
       const delta = choice.delta as Record<string, unknown> | undefined;
       if (delta?.content && typeof delta.content === "string") {
-        events.push(...this.ensureBlockOpen());
+        events.push(...this.startBlock("text"));
         this.outputChars += delta.content.length;
         events.push(
           this.sse("content_block_delta", {
@@ -1269,7 +1803,7 @@ export class StreamConverter {
       }
 
       if (choice.finish_reason === "stop") {
-        events.push(...this.closeBlock());
+        events.push(...this.closeOpenBlock("text"));
         events.push(...this.emitFinish("end_turn"));
       }
     }
@@ -1282,7 +1816,18 @@ export class StreamConverter {
     if (this.finished) return [];
     const events: string[] = [];
     events.push(...this.ensureStarted());
-    events.push(...this.closeBlock());
+    events.push(...this.closeOpenBlock());
+    if (this.pendingToolCall) {
+      if (
+        !this.pendingToolCall.emittedArgumentsDelta &&
+        this.pendingToolCall.argumentsBuffer
+      ) {
+        events.push(
+          this.emitToolArgumentDelta(this.pendingToolCall.argumentsBuffer)
+        );
+      }
+      events.push(...this.finishToolCall());
+    }
     events.push(...this.emitFinish("end_turn"));
     return events;
   }
@@ -1309,25 +1854,59 @@ export function estimateTokens(text: string): number {
 /** Estimate total tokens in an Anthropic request. */
 export function estimateRequestTokens(req: AnthropicRequest): number {
   let total = 0;
-  if (typeof req.system === "string") {
-    total += estimateTokens(req.system);
-  } else if (Array.isArray(req.system)) {
-    for (const s of req.system) total += estimateTokens(s.text || "");
+  for (const text of extractSystemTexts(req)) {
+    total += estimateTokens(text);
   }
   for (const msg of req.messages) {
+    total += estimateTokens(msg.role);
     if (typeof msg.content === "string") {
       total += estimateTokens(msg.content);
     } else if (Array.isArray(msg.content)) {
       for (const block of msg.content) {
         if (block.type === "text") total += estimateTokens(block.text);
-        else if (block.type === "tool_use")
+        else if (block.type === "image") {
+          total += estimateTokens(block.source.media_type || "");
+          total += estimateTokens(block.source.url || "");
+          total += estimateTokens(block.source.data || "");
+        } else if (block.type === "tool_use") {
+          total += estimateTokens(block.id);
+          total += estimateTokens(block.name);
           total += estimateTokens(JSON.stringify(block.input));
-        else if (block.type === "tool_result") {
+        } else if (block.type === "tool_result") {
+          total += estimateTokens(block.tool_use_id);
           if (typeof block.content === "string")
             total += estimateTokens(block.content);
+          else if (Array.isArray(block.content)) {
+            for (const part of block.content) {
+              if (part.type === "text") {
+                total += estimateTokens(part.text);
+              } else if (part.type === "image") {
+                total += estimateTokens(part.source.media_type || "");
+                total += estimateTokens(part.source.url || "");
+                total += estimateTokens(part.source.data || "");
+              }
+            }
+          }
         }
       }
     }
+  }
+  if (Array.isArray(req.tools)) {
+    for (const tool of req.tools) {
+      total += estimateTokens(tool.type || "");
+      total += estimateTokens(tool.name || "");
+      total += estimateTokens(tool.description || "");
+      if (tool.input_schema) {
+        total += estimateTokens(JSON.stringify(tool.input_schema));
+      }
+    }
+  }
+  if (req.tool_choice) {
+    total += estimateTokens(
+      typeof req.tool_choice === "string"
+        ? req.tool_choice
+        : JSON.stringify(req.tool_choice)
+    );
   }
   return total;
 }

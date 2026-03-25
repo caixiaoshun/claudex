@@ -24,6 +24,27 @@ function asCodexMessage(item: unknown): { role: string; content: unknown } {
   return item as { role: string; content: unknown };
 }
 
+function asFunctionTool(
+  tool: NonNullable<ReturnType<typeof anthropicToCodex>["tools"]>[number]
+): {
+  type: "function";
+  name: string;
+  description?: string;
+  strict?: boolean;
+  parameters: Record<string, unknown>;
+} {
+  assert.equal(tool.type, "function");
+  assert.ok(tool.name);
+  assert.ok(tool.parameters);
+  return tool as {
+    type: "function";
+    name: string;
+    description?: string;
+    strict?: boolean;
+    parameters: Record<string, unknown>;
+  };
+}
+
 describe("anthropicToCodex", () => {
   it("should convert a simple text request", () => {
     const req: AnthropicRequest = {
@@ -46,7 +67,7 @@ describe("anthropicToCodex", () => {
     assert.equal(message.content, "Hello, world!");
   });
 
-  it("should convert system prompt to instructions", () => {
+  it("should convert system prompt to a developer message", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -56,10 +77,24 @@ describe("anthropicToCodex", () => {
 
     const result = anthropicToCodex(req);
 
-    assert.equal(result.instructions, "You are a helpful coding assistant.");
+    assert.equal(result.instructions, "");
+    assert.equal(result.input.length, 2);
+    assert.deepEqual(result.input[0], {
+      role: "developer",
+      content: [
+        {
+          type: "input_text",
+          text: "You are a helpful coding assistant.",
+        },
+      ],
+    });
+    assert.deepEqual(result.input[1], {
+      role: "user",
+      content: "Help me",
+    });
   });
 
-  it("should convert array system prompt", () => {
+  it("should convert array system prompt into developer content parts", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -72,7 +107,37 @@ describe("anthropicToCodex", () => {
 
     const result = anthropicToCodex(req);
 
-    assert.equal(result.instructions, "You are helpful.\nBe concise.");
+    assert.equal(result.instructions, "");
+    assert.equal(result.input.length, 2);
+    assert.deepEqual(result.input[0], {
+      role: "developer",
+      content: [
+        { type: "input_text", text: "You are helpful." },
+        { type: "input_text", text: "Be concise." },
+      ],
+    });
+    assert.deepEqual(result.input[1], {
+      role: "user",
+      content: "Hello",
+    });
+  });
+
+  it("should skip empty system prompts instead of emitting a blank developer message", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      system: "",
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.instructions, "");
+    assert.equal(result.input.length, 1);
+    assert.deepEqual(result.input[0], {
+      role: "user",
+      content: "Hello",
+    });
   });
 
   it("should convert multi-turn conversation", () => {
@@ -94,7 +159,9 @@ describe("anthropicToCodex", () => {
     const third = asCodexMessage(result.input[2]);
     assert.equal(first.content, "Hello");
     assert.equal(second.role, "assistant");
-    assert.equal(second.content, "Hi there!");
+    assert.deepEqual(second.content, [
+      { type: "output_text", text: "Hi there!" },
+    ]);
     assert.equal(third.content, "How are you?");
   });
 
@@ -165,7 +232,7 @@ describe("anthropicToCodex", () => {
     ]);
   });
 
-  it("should convert tools to OpenAI format with strict schema", () => {
+  it("should convert tools to OpenAI format with Claude-compatible tool strictness", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -184,18 +251,18 @@ describe("anthropicToCodex", () => {
     };
 
     const result = anthropicToCodex(req);
+    const tool = asFunctionTool(result.tools![0]);
 
     assert.ok(result.tools);
     assert.equal(result.tools!.length, 1);
-    assert.equal(result.tools![0].type, "function");
-    assert.equal(result.tools![0].name, "get_weather");
-    assert.equal(result.tools![0].description, "Get current weather");
-    assert.equal(result.tools![0].strict, true);
-    assert.equal(result.tools![0].parameters.additionalProperties, false);
-    assert.deepEqual(result.tools![0].parameters.required, ["location"]);
+    assert.equal(tool.type, "function");
+    assert.equal(tool.name, "get_weather");
+    assert.equal(tool.description, "Get current weather");
+    assert.equal(tool.strict, false);
+    assert.deepEqual(tool.parameters.required, ["location"]);
   });
 
-  it("should enforce required includes all property keys", () => {
+  it("should preserve declared required keys without forcing optional tool parameters", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -219,13 +286,13 @@ describe("anthropicToCodex", () => {
     };
 
     const result = anthropicToCodex(req);
+    const tool = asFunctionTool(result.tools![0]);
 
-    // All keys from properties must be in required
-    const required = result.tools![0].parameters.required as string[];
+    const required = tool.parameters.required as string[];
     assert.ok(required.includes("a"));
-    assert.ok(required.includes("b"));
-    assert.ok(required.includes("c"));
-    assert.equal(required.length, 3);
+    assert.ok(!required.includes("b"));
+    assert.ok(!required.includes("c"));
+    assert.equal(required.length, 1);
   });
 
   it("should convert stream flag", () => {
@@ -315,7 +382,7 @@ describe("anthropicToCodex", () => {
     assert.equal(result.input.length, 3);
     assert.deepEqual(result.input[0], {
       role: "assistant",
-      content: "Let me check the weather.",
+      content: [{ type: "output_text", text: "Let me check the weather." }],
     });
     assert.deepEqual(result.input[1], {
       type: "function_call",
@@ -328,6 +395,72 @@ describe("anthropicToCodex", () => {
       call_id: "toolu_123",
       output: "Sunny, 25°C",
     });
+  });
+
+  it("should preserve assistant and user content order around tool turns", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Before tool" },
+            {
+              type: "tool_use",
+              id: "toolu_1",
+              name: "get_weather",
+              input: { location: "Tokyo" },
+            },
+            { type: "text", text: "After tool" },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Before result" },
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: "Sunny",
+            },
+            { type: "text", text: "After result" },
+          ],
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.deepEqual(result.input, [
+      {
+        role: "assistant",
+        content: [{ type: "output_text", text: "Before tool" }],
+      },
+      {
+        type: "function_call",
+        call_id: "toolu_1",
+        name: "get_weather",
+        arguments: "{\"location\":\"Tokyo\"}",
+      },
+      {
+        role: "assistant",
+        content: [{ type: "output_text", text: "After tool" }],
+      },
+      {
+        role: "user",
+        content: "Before result",
+      },
+      {
+        type: "function_call_output",
+        call_id: "toolu_1",
+        output: "Sunny",
+      },
+      {
+        role: "user",
+        content: "After result",
+      },
+    ]);
   });
 
   it("should set tool_choice and parallel_tool_calls when tools present", () => {
@@ -348,6 +481,31 @@ describe("anthropicToCodex", () => {
 
     assert.equal(result.tool_choice, "auto");
     assert.equal(result.parallel_tool_calls, true);
+  });
+
+  it("should default parallel_tool_calls to true even before tools are declared", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.parallel_tool_calls, true);
+  });
+
+  it("should disable parallel_tool_calls without requiring tools in the request", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      tool_choice: { disable_parallel_tool_use: true },
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.parallel_tool_calls, false);
   });
 
   it("should strip Anthropic-specific fields (betas, metadata, thinking, stream_options)", () => {
@@ -386,7 +544,22 @@ describe("anthropicToCodex", () => {
     assert.equal(result.reasoning!.effort, "high");
   });
 
-  it("should always include include field as empty array", () => {
+  it("should default to medium reasoning when Claude Code does not send thinking config", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.deepEqual(result.reasoning, {
+      effort: "medium",
+      summary: "auto",
+    });
+  });
+
+  it("should always include reasoning.encrypted_content in include", () => {
     const req: AnthropicRequest = {
       model: "claude-3-5-sonnet-20241022",
       max_tokens: 1024,
@@ -396,7 +569,126 @@ describe("anthropicToCodex", () => {
     const result = anthropicToCodex(req);
 
     assert.ok(Array.isArray(result.include));
-    assert.equal(result.include.length, 0);
+    assert.deepEqual(result.include, ["reasoning.encrypted_content"]);
+  });
+
+  it("should respect disable_parallel_tool_use when Claude Code requests serial tools", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Hello" }],
+      tool_choice: { disable_parallel_tool_use: true },
+      tools: [
+        {
+          name: "get_weather",
+          description: "Get current weather",
+          input_schema: { type: "object", properties: {} },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.parallel_tool_calls, false);
+  });
+
+  it("should shorten long tool names consistently across tools and tool_use history", () => {
+    const longToolName =
+      "mcp__workspace__super_long_tool_name_that_keeps_going_for_claude_code_roundtrip_validation";
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu_123",
+              name: longToolName,
+              input: { path: "/tmp/demo" },
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: longToolName,
+          description: "Long MCP tool name",
+          input_schema: {
+            type: "object",
+            properties: { path: { type: "string" } },
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const tool = asFunctionTool(result.tools![0]);
+    const functionCall = result.input[0] as {
+      type: "function_call";
+      name: string;
+    };
+
+    assert.ok(tool.name.length <= 64);
+    assert.equal(functionCall.name, tool.name);
+    assert.notEqual(tool.name, longToolName);
+  });
+
+  it("should map Claude web_search built-ins to Codex web_search", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "Search the web" }],
+      tools: [{ type: "web_search_20250305" }],
+    };
+
+    const result = anthropicToCodex(req);
+
+    assert.equal(result.tools?.[0]?.type, "web_search");
+  });
+
+  it("should preserve structured tool_result content with text and images", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_123",
+              content: [
+                { type: "text", text: "Screenshot from tool" },
+                {
+                  type: "image",
+                  source: {
+                    type: "url",
+                    url: "https://example.com/tool.png",
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const toolOutput = result.input[0] as {
+      type: "function_call_output";
+      output: Array<{ type: string; text?: string; image_url?: string }>;
+    };
+
+    assert.equal(toolOutput.type, "function_call_output");
+    assert.deepEqual(toolOutput.output, [
+      { type: "input_text", text: "Screenshot from tool" },
+      {
+        type: "input_image",
+        image_url: "https://example.com/tool.png",
+      },
+    ]);
   });
 
   it("should only contain whitelisted fields", () => {
@@ -604,41 +896,6 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function expectedRequiredKeys(
-  properties: Record<string, unknown>
-): string[] {
-  return Object.entries(properties)
-    .filter(([, schema]) => {
-      if (!isObjectRecord(schema)) {
-        return true;
-      }
-
-      return !(
-        schema.type === "object" &&
-        !isObjectRecord(schema.properties) &&
-        schema.items === undefined &&
-        isObjectRecord(schema.additionalProperties)
-      );
-    })
-    .filter(([, schema]) => {
-      if (!isObjectRecord(schema)) {
-        return true;
-      }
-
-      return !(
-        schema.type === "object" &&
-        (!isObjectRecord(schema.properties) ||
-          Object.keys(schema.properties).length === 0) &&
-        schema.items === undefined &&
-        !Array.isArray(schema.anyOf) &&
-        schema.enum === undefined &&
-        schema.const === undefined &&
-        !isObjectRecord(schema.additionalProperties)
-      );
-    })
-    .map(([key]) => key);
-}
-
 function visitSchemaNodes(
   node: unknown,
   visitor: (schema: Record<string, unknown>) => void
@@ -694,13 +951,15 @@ function assertSchemaInvariants(node: unknown): void {
       return;
     }
 
-    const keys = expectedRequiredKeys(properties);
-    assert.equal(schema.additionalProperties, false);
     assert.equal(schema.type, "object");
-    assert.deepEqual(
-      new Set((schema.required as string[]) ?? []),
-      new Set(keys)
-    );
+
+    if (schema.required !== undefined) {
+      assert.ok(Array.isArray(schema.required));
+      for (const entry of schema.required as string[]) {
+        assert.equal(typeof entry, "string");
+        assert.ok(entry in properties);
+      }
+    }
   });
 }
 
@@ -819,11 +1078,9 @@ describe("sanitizeToolSchema", () => {
 
     assert.equal(props.choice.oneOf, undefined);
     assert.equal(props.choice.type, "object");
-    assert.equal(props.choice.additionalProperties, false);
 
     assert.equal(props.combined.allOf, undefined);
     assert.equal(props.combined.type, "object");
-    assert.equal(props.combined.additionalProperties, false);
   });
 
   it("should strip $schema, $id, $ref, examples, and other unsupported keywords", () => {
@@ -856,7 +1113,7 @@ describe("sanitizeToolSchema", () => {
     assert.equal(name.pattern, undefined);
   });
 
-  it("should enforce required = all property keys at every level", () => {
+  it("should preserve declared required keys while filtering invalid entries", () => {
     const schema = {
       type: "object",
       properties: {
@@ -872,14 +1129,9 @@ describe("sanitizeToolSchema", () => {
       required: [], // empty
     };
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
-    // top level: required should include "outer"
-    assert.deepEqual(result.required, ["outer"]);
-    // nested level: required should include both inner keys
+    assert.deepEqual(result.required, []);
     const outer = (result.properties as Record<string, Record<string, unknown>>).outer;
-    const innerRequired = outer.required as string[];
-    assert.ok(innerRequired.includes("inner_a"));
-    assert.ok(innerRequired.includes("inner_b"));
-    assert.equal(innerRequired.length, 2);
+    assert.deepEqual(outer.required, ["inner_a"]);
   });
 
   it("should drop required keys that are no longer present in properties", () => {
@@ -920,10 +1172,10 @@ describe("sanitizeToolSchema", () => {
 
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
 
-    assert.deepEqual(result.required, ["questions", "metadata"]);
+    assert.deepEqual(result.required, ["questions"]);
   });
 
-  it("should force additionalProperties false on unknown record value schemas", () => {
+  it("should normalize unknown record value schemas without forcing extra object constraints", () => {
     const schema = {
       type: "object",
       properties: {
@@ -942,7 +1194,6 @@ describe("sanitizeToolSchema", () => {
     assert.equal(metadata.type, "object");
     assert.ok(isObjectRecord(metadata.additionalProperties));
     assert.equal(metadataValue.type, "object");
-    assert.equal(metadataValue.additionalProperties, false);
   });
 
   it("should exclude stripped combinator shells from required", () => {
@@ -965,14 +1216,12 @@ describe("sanitizeToolSchema", () => {
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
     const props = result.properties as Record<string, Record<string, unknown>>;
 
-    assert.deepEqual(result.required, []);
+    assert.deepEqual(result.required, ["choice", "combo"]);
     assert.equal(props.choice.type, "object");
-    assert.equal(props.choice.additionalProperties, false);
     assert.equal(props.combo.type, "object");
-    assert.equal(props.combo.additionalProperties, false);
   });
 
-  it("should enforce additionalProperties = false at every object level", () => {
+  it("should preserve explicit additionalProperties settings when not tightening schemas", () => {
     const schema = {
       type: "object",
       properties: {
@@ -986,9 +1235,9 @@ describe("sanitizeToolSchema", () => {
       },
     };
     const result = sanitizeToolSchema(schema) as Record<string, unknown>;
-    assert.equal(result.additionalProperties, false);
+    assert.equal(result.additionalProperties, undefined);
     const nested = (result.properties as Record<string, Record<string, unknown>>).nested;
-    assert.equal(nested.additionalProperties, false);
+    assert.equal(nested.additionalProperties, true);
   });
 
   it("should handle primitives and null gracefully", () => {
@@ -1052,9 +1301,7 @@ describe("sanitizeToolSchema", () => {
     assert.equal(branch0Props.name.type, "string");
     assert.equal((branch0Props.port as Record<string, unknown>).minimum, undefined);
     assert.equal((branch0Props.port as Record<string, unknown>).maximum, undefined);
-    // required should include all keys in the branch
-    assert.deepEqual(anyOf[0].required, ["name", "port"]);
-    assert.equal(anyOf[0].additionalProperties, false);
+    assert.deepEqual(anyOf[0].required, ["name"]);
     // Second branch: format stripped
     assert.equal(anyOf[1].format, undefined);
     assert.equal(anyOf[1].type, "string");
@@ -1103,7 +1350,7 @@ describe("sanitizeToolSchema", () => {
 
     assert.equal(nestedProps.preview.format, undefined);
     assert.equal((nestedProps.score as Record<string, unknown>).minimum, undefined);
-    assert.deepEqual(nested.required, ["preview", "score"]);
+    assert.deepEqual(nested.required, []);
   });
 
   it("should add type: object to schema nodes missing a type field (Codex requirement)", () => {
@@ -1270,23 +1517,17 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters as Record<string, unknown>;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const allowedPrompts = (params.properties as Record<string, Record<string, unknown>>)
       .allowedPrompts;
     const promptItem = allowedPrompts.items as Record<string, unknown>;
 
     assert.equal(params.type, "object");
-    assert.equal(params.additionalProperties, false);
-    assert.deepEqual(
-      new Set((params.required as string[]) ?? []),
-      new Set(["allowedPrompts"])
-    );
+    assert.equal(params.additionalProperties, undefined);
+    assert.equal(params.required, undefined);
     assert.equal(promptItem.type, "object");
-    assert.equal(promptItem.additionalProperties, false);
-    assert.deepEqual(
-      new Set((promptItem.required as string[]) ?? []),
-      new Set(["tool", "prompt"])
-    );
+    assert.equal(promptItem.additionalProperties, undefined);
+    assert.equal(promptItem.required, undefined);
     assertSchemaInvariants(params);
   });
 
@@ -1305,37 +1546,27 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters as Record<string, unknown>;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const props = params.properties as Record<string, Record<string, unknown>>;
     const answers = props.answers;
     const annotations = props.annotations;
     const annotationValue = annotations.additionalProperties as Record<string, unknown>;
     const metadata = props.metadata;
 
-    assert.equal(params.additionalProperties, false);
-    assert.deepEqual(
-      new Set((params.required as string[]) ?? []),
-      new Set(["questions", "metadata"])
-    );
+    assert.equal(params.additionalProperties, undefined);
+    assert.equal(params.required, undefined);
     assert.ok(isObjectRecord(answers.additionalProperties));
     assert.equal(
       (answers.additionalProperties as Record<string, unknown>).format,
       undefined
     );
-    assert.ok(!(params.required as string[]).includes("answers"));
-    assert.ok(!(params.required as string[]).includes("annotations"));
+    assert.equal(params.required, undefined);
     assert.equal(annotationValue.type, "object");
-    assert.equal(annotationValue.additionalProperties, false);
-    assert.deepEqual(
-      new Set((annotationValue.required as string[]) ?? []),
-      new Set(["preview", "notes"])
-    );
+    assert.equal(annotationValue.additionalProperties, undefined);
+    assert.equal(annotationValue.required, undefined);
     assert.equal(metadata.type, "object");
-    assert.equal(metadata.additionalProperties, false);
-    assert.deepEqual(
-      new Set((metadata.required as string[]) ?? []),
-      new Set(["source"])
-    );
+    assert.equal(metadata.additionalProperties, undefined);
+    assert.equal(metadata.required, undefined);
     assertSchemaInvariants(params);
   });
 
@@ -1354,19 +1585,19 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters as Record<string, unknown>;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const metadata = (params.properties as Record<string, Record<string, unknown>>)
       .metadata;
     const metadataValue = metadata.additionalProperties as Record<string, unknown>;
 
     assert.deepEqual(
       new Set((params.required as string[]) ?? []),
-      new Set(["subject", "description", "activeForm"])
+      new Set(["subject", "description"])
     );
     assert.equal(metadata.type, "object");
     assert.ok(isObjectRecord(metadata.additionalProperties));
     assert.equal(metadataValue.type, "object");
-    assert.equal(metadataValue.additionalProperties, false);
+    assert.equal(metadataValue.additionalProperties, undefined);
   });
 
   it("should strip format:uri from WebFetch-like tool", () => {
@@ -1390,14 +1621,13 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
       ],
     };
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const url = (params.properties as Record<string, Record<string, unknown>>).url;
     assert.equal(url.type, "string");
     assert.equal(url.format, undefined);
-    // required includes all keys
     assert.ok((params.required as string[]).includes("url"));
-    assert.ok((params.required as string[]).includes("raw"));
-    assert.equal(params.additionalProperties, false);
+    assert.ok(!(params.required as string[]).includes("raw"));
+    assert.equal(params.additionalProperties, undefined);
     assertSchemaInvariants(params);
   });
 
@@ -1435,7 +1665,7 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
       ],
     };
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters;
+    const params = asFunctionTool(result.tools![0]).parameters;
     // $schema stripped at top
     assert.equal((params as unknown as Record<string, unknown>).$schema, undefined);
     // format stripped from endpoint
@@ -1488,9 +1718,9 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters as Record<string, unknown>;
+    const params = asFunctionTool(result.tools![0]).parameters;
 
-    assert.deepEqual(params.required, []);
+    assert.equal(params.required, undefined);
     assertSchemaInvariants(params);
   });
 
@@ -1523,14 +1753,14 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const annotations = (params.properties as Record<string, Record<string, unknown>>)
       .annotations;
     const nested = annotations.additionalProperties as Record<string, unknown>;
     const nestedProps = nested.properties as Record<string, Record<string, unknown>>;
 
     assert.equal(nestedProps.preview.format, undefined);
-    assert.deepEqual(nested.required, ["preview", "label"]);
+    assert.equal(nested.required, undefined);
   });
 
   it("should normalize Agent tools used for subagents", () => {
@@ -1548,10 +1778,10 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const params = result.tools![0].parameters as Record<string, unknown>;
+    const params = asFunctionTool(result.tools![0]).parameters;
     const props = params.properties as Record<string, Record<string, unknown>>;
 
-    assert.equal(result.tools![0].name, "Agent");
+    assert.equal(asFunctionTool(result.tools![0]).name, "Agent");
     assert.deepEqual(props.model.enum, ["sonnet", "opus", "haiku"]);
     assert.equal(props.run_in_background.type, "boolean");
     assert.equal(props.subagent_type.type, "string");
@@ -1588,16 +1818,17 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const names = result.tools!.map((tool) => tool.name);
+    const names = result.tools!.map((tool) => asFunctionTool(tool).name);
     assert.deepEqual(names, ["Bash", "Read", "Edit", "TodoWrite"]);
 
     for (const tool of result.tools!) {
-      assert.equal(tool.strict, true);
-      assert.equal(tool.parameters.additionalProperties, false);
-      assertSchemaInvariants(tool.parameters);
+      const functionTool = asFunctionTool(tool);
+      assert.equal(functionTool.strict, false);
+      assert.equal(functionTool.parameters.additionalProperties, undefined);
+      assertSchemaInvariants(functionTool.parameters);
     }
 
-    const bashParams = result.tools![0].parameters as Record<string, unknown>;
+    const bashParams = asFunctionTool(result.tools![0]).parameters;
     const bashNested = (
       (bashParams.properties as Record<string, Record<string, unknown>>)
         ._simulatedSedEdit.properties as Record<string, Record<string, unknown>>
@@ -1636,8 +1867,8 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const tool = result.tools![0];
-    const params = tool.parameters as Record<string, unknown>;
+    const tool = asFunctionTool(result.tools![0]);
+    const params = tool.parameters;
     const metadata = (
       params.properties as Record<string, Record<string, unknown>>
     ).metadata;
@@ -1692,14 +1923,14 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     };
 
     const result = anthropicToCodex(req);
-    const names = result.tools!.map((tool) => tool.name);
+    const names = result.tools!.map((tool) => asFunctionTool(tool).name);
     assert.deepEqual(names, [
       "Skill",
       "ListMcpResourcesTool",
       "ReadMcpResourceTool",
     ]);
 
-    const readMcpParams = result.tools![2].parameters as Record<string, unknown>;
+    const readMcpParams = asFunctionTool(result.tools![2]).parameters;
     const uri = (
       readMcpParams.properties as Record<string, Record<string, unknown>>
     ).uri;
@@ -1707,9 +1938,10 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     assert.equal(uri.format, undefined);
 
     for (const tool of result.tools!) {
-      assert.equal(tool.type, "function");
-      assert.equal(tool.strict, true);
-      assertSchemaInvariants(tool.parameters);
+      const functionTool = asFunctionTool(tool);
+      assert.equal(functionTool.type, "function");
+      assert.equal(functionTool.strict, false);
+      assertSchemaInvariants(functionTool.parameters);
     }
   });
 });
@@ -1804,6 +2036,82 @@ describe("codexToAnthropic", () => {
     const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
 
     assert.equal(result.stop_reason, "max_tokens");
+  });
+
+  it("should restore original tool names from shortened Codex names", () => {
+    const originalName =
+      "mcp__workspace__super_long_tool_name_that_keeps_going_for_claude_code_roundtrip_validation";
+    const shortenedName = asFunctionTool(
+      anthropicToCodex({
+        model: "claude-3-5-sonnet-20241022",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: "Hello" }],
+        tools: [
+          {
+            name: originalName,
+            description: "Long MCP tool name",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+      }).tools![0]
+    ).name;
+    const codexRes = {
+      id: "resp_abc123",
+      status: "completed",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_123",
+          name: shortenedName,
+          arguments: '{"location":"Tokyo"}',
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 15 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022", [
+      {
+        name: originalName,
+        description: "Long MCP tool name",
+        input_schema: { type: "object", properties: {} },
+      },
+    ]);
+
+    assert.equal(result.content[0].type, "tool_use");
+    assert.equal(
+      (result.content[0] as { type: "tool_use"; name: string }).name,
+      originalName
+    );
+  });
+
+  it("should surface reasoning output as Anthropic thinking blocks", () => {
+    const codexRes = {
+      id: "resp_abc123",
+      status: "completed",
+      output: [
+        {
+          type: "reasoning",
+          summary: [{ text: "plan first" }],
+        },
+        {
+          type: "message",
+          content: [{ type: "output_text", text: "done" }],
+        },
+      ],
+      usage: { input_tokens: 10, output_tokens: 5 },
+    };
+
+    const result = codexToAnthropic(codexRes, "claude-3-5-sonnet-20241022");
+
+    assert.equal(result.content[0].type, "thinking");
+    assert.equal(
+      (result.content[0] as { type: "thinking"; thinking: string }).thinking,
+      "plan first"
+    );
+    assert.equal(
+      (result.content[1] as { type: "text"; text: string }).text,
+      "done"
+    );
   });
 });
 
@@ -1907,8 +2215,9 @@ describe("StreamConverter", () => {
       "response.reasoning_summary_text.delta",
       { delta: "reasoning...", summary_index: 0 }
     );
-    // Should emit message_start but no text delta (reasoning is consumed silently)
+    // Should emit message_start and a thinking delta block.
     assert.ok(events.some((e) => e.includes("message_start")));
+    assert.ok(events.some((e) => e.includes("thinking_delta")));
   });
 
   it("should handle response.reasoning_text.delta without error", () => {
@@ -1927,6 +2236,52 @@ describe("StreamConverter", () => {
       { summary_index: 0 }
     );
     assert.ok(events.some((e) => e.includes("message_start")));
+  });
+
+  it("should stream function_call arguments deltas and restore original long tool names", () => {
+    const originalName =
+      "mcp__workspace__super_long_tool_name_that_keeps_going_for_claude_code_roundtrip_validation";
+    const shortenedName = asFunctionTool(
+      anthropicToCodex({
+        model: "claude-3-5-sonnet-20241022",
+        max_tokens: 1024,
+        messages: [{ role: "user", content: "Hello" }],
+        tools: [
+          {
+            name: originalName,
+            description: "Long MCP tool name",
+            input_schema: { type: "object", properties: {} },
+          },
+        ],
+      }).tools![0]
+    ).name;
+    const converter = new StreamConverter("claude-3-5-sonnet-20241022", [
+      {
+        name: originalName,
+        description: "Long MCP tool name",
+        input_schema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const added = converter.processEvent("response.output_item.added", {
+      output_index: 0,
+      item: {
+        type: "function_call",
+        id: "fc_call_123",
+        call_id: "call_123",
+        name: shortenedName,
+      },
+    });
+    const delta = converter.processEvent("response.function_call_arguments.delta", {
+      item_id: "fc_call_123",
+      output_index: 0,
+      delta: '{"location":"Tok',
+    });
+
+    assert.ok(added.some((e) => e.includes(originalName)));
+    assert.ok(delta.some((e) => e.includes("input_json_delta")));
+    assert.ok(delta.some((e) => e.includes("location")));
+    assert.ok(delta.some((e) => e.includes("Tok")));
   });
 });
 

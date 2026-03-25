@@ -5,6 +5,7 @@
 import * as http from "node:http";
 import * as logger from "./logger.js";
 import * as oauth from "./oauth.js";
+import { applyClaudeSessionFallback } from "./claude-session-bridge.js";
 import {
   anthropicToCodex,
   codexToAnthropic,
@@ -99,7 +100,9 @@ function logSchemaForTool(
   }
 
   if (Array.isArray(codexReq.tools)) {
-    const convertedTool = codexReq.tools.find((tool) => tool.name === toolName);
+    const convertedTool = codexReq.tools.find(
+      (tool) => tool.type === "function" && tool.name === toolName
+    );
     if (convertedTool) {
       logger.debug("Converted tool schema for failed tool", {
         name: convertedTool.name,
@@ -117,6 +120,7 @@ async function handleMessages(
   res: http.ServerResponse
 ): Promise<void> {
   let anthropicReq: AnthropicRequest;
+  let effectiveReq: AnthropicRequest;
 
   try {
     const body = await readBody(req);
@@ -127,14 +131,101 @@ async function handleMessages(
     return;
   }
 
-  const estimatedTokens = estimateRequestTokens(anthropicReq);
-  const isStream = anthropicReq.stream === true;
+  try {
+    effectiveReq = await applyClaudeSessionFallback(anthropicReq);
+  } catch (error) {
+    logger.warn("Claude session fallback failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    effectiveReq = anthropicReq;
+  }
+
+  const estimatedTokens = estimateRequestTokens(effectiveReq);
+  const isStream = effectiveReq.stream === true;
+  const systemSummaries = Array.isArray(effectiveReq.system)
+    ? effectiveReq.system.map((block) => ({
+        type: block.type,
+        preview:
+          typeof block.text === "string"
+            ? block.text.length > 2000
+              ? `${block.text.slice(0, 2000)}...`
+              : block.text
+            : undefined,
+      }))
+    : typeof effectiveReq.system === "string"
+      ? [
+          {
+            type: "text",
+            preview:
+              effectiveReq.system.length > 2000
+                ? `${effectiveReq.system.slice(0, 2000)}...`
+                : effectiveReq.system,
+          },
+        ]
+      : [];
+  const messageSummaries = effectiveReq.messages.map((message) => ({
+    role: message.role,
+    content:
+      typeof message.content === "string"
+        ? "string"
+        : message.content.map((block) =>
+            block.type === "text"
+              ? {
+                  type: "text",
+                  preview:
+                    block.text.length > 2000
+                      ? `${block.text.slice(0, 2000)}...`
+                      : block.text,
+                }
+              : block.type
+          ),
+  }));
+  const extraRequestKeys = Object.keys(effectiveReq).filter(
+    (key) =>
+      ![
+        "model",
+        "max_tokens",
+        "messages",
+        "system",
+        "tools",
+        "stream",
+        "temperature",
+        "top_p",
+        "stop_sequences",
+        "betas",
+        "metadata",
+        "thinking",
+        "output_config",
+        "stream_options",
+        "max_output_tokens",
+        "tool_choice",
+      ].includes(key)
+  );
 
   logger.requestLog(
-    anthropicReq.model,
+    effectiveReq.model,
     estimatedTokens,
     isStream ? "stream" : "sync"
   );
+  logger.debug("Anthropic request summary", {
+    originalMessageCount: anthropicReq.messages.length,
+    messageCount: effectiveReq.messages.length,
+    toolCount: Array.isArray(effectiveReq.tools) ? effectiveReq.tools.length : 0,
+    systemType:
+      typeof effectiveReq.system === "string"
+        ? "string"
+        : Array.isArray(effectiveReq.system)
+          ? "array"
+          : "none",
+    systemSummaries,
+    messageSummaries,
+    extraRequestKeys,
+    contextManagement:
+      "context_management" in effectiveReq
+        ? effectiveReq.context_management
+        : undefined,
+    requestHeaders: req.headers,
+  });
 
   // Get valid session (refresh if needed)
   let session;
@@ -156,12 +247,12 @@ async function handleMessages(
   // Anthropic client asked for a sync response, so the proxy always talks to
   // Codex over SSE and aggregates back to JSON when needed.
   const codexReq = {
-    ...anthropicToCodex(anthropicReq),
+    ...anthropicToCodex(effectiveReq),
     stream: true,
   };
 
   logger.debug("Resolved model mapping", {
-    anthropicModel: anthropicReq.model,
+    anthropicModel: effectiveReq.model,
     codexModel: codexReq.model,
     reasoning:
       isRecord(codexReq.reasoning) && typeof codexReq.reasoning.effort === "string"
@@ -176,9 +267,12 @@ async function handleMessages(
     "TaskUpdate",
     "Task",
   ]);
-  if (Array.isArray(anthropicReq.tools)) {
-    const incomingTools = anthropicReq.tools
-      .filter((tool) => schemaDebugTools.has(tool.name))
+  if (Array.isArray(effectiveReq.tools)) {
+    const incomingTools = effectiveReq.tools
+      .filter(
+        (tool) =>
+          typeof tool.name === "string" && schemaDebugTools.has(tool.name)
+      )
       .map((tool) => ({
         name: tool.name,
         input_schema: tool.input_schema,
@@ -190,7 +284,12 @@ async function handleMessages(
 
   if (Array.isArray(codexReq.tools)) {
     const convertedTools = codexReq.tools
-      .filter((tool) => schemaDebugTools.has(tool.name))
+      .filter(
+        (tool) =>
+          tool.type === "function" &&
+          typeof tool.name === "string" &&
+          schemaDebugTools.has(tool.name)
+      )
       .map((tool) => ({
         name: tool.name,
         parameters: tool.parameters,
@@ -241,7 +340,7 @@ async function handleMessages(
         logSchemaForTool(failedToolName, anthropicReq, codexReq);
       }
       logger.requestLog(
-        anthropicReq.model,
+        effectiveReq.model,
         estimatedTokens,
         `error:${codexRes.status}`
       );
@@ -269,9 +368,9 @@ async function handleMessages(
     }
 
     if (isStream) {
-      await handleStreamResponse(codexRes, res, anthropicReq);
+      await handleStreamResponse(codexRes, res, effectiveReq);
     } else {
-      await handleSyncResponse(codexRes, res, anthropicReq);
+      await handleSyncResponse(codexRes, res, effectiveReq);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -282,6 +381,26 @@ async function handleMessages(
     res.end(
       JSON.stringify(buildErrorResponse(500, `Proxy error: ${msg}`))
     );
+  }
+}
+
+async function handleCountTokens(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  try {
+    const body = await readBody(req);
+    const anthropicReq = JSON.parse(body) as AnthropicRequest;
+    const effectiveReq = await applyClaudeSessionFallback(anthropicReq);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        input_tokens: estimateRequestTokens(effectiveReq),
+      })
+    );
+  } catch {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(buildErrorResponse(400, "Invalid JSON body")));
   }
 }
 
@@ -305,7 +424,11 @@ async function handleSyncResponse(
     return;
   }
 
-  const anthropicRes = codexToAnthropic(body, anthropicReq.model);
+  const anthropicRes = codexToAnthropic(
+    body,
+    anthropicReq.model,
+    anthropicReq.tools
+  );
 
   logger.requestLog(
     anthropicReq.model,
@@ -331,7 +454,10 @@ async function handleStreamResponse(
     Connection: "keep-alive",
   });
 
-  const converter = new StreamConverter(anthropicReq.model);
+  const converter = new StreamConverter(
+    anthropicReq.model,
+    anthropicReq.tools
+  );
 
   try {
     const reader = codexRes.body?.getReader();
@@ -436,9 +562,90 @@ export async function collectCodexResponseFromSSE(
   let buffer = "";
   let finalResponse: Record<string, unknown> | null = null;
   let currentText = "";
+  let currentThinking = "";
   const fallbackOutput: Array<Record<string, unknown>> = [];
   let usage: Record<string, unknown> | undefined;
   let status = "completed";
+
+  interface PendingFunctionCall {
+    itemId?: string;
+    outputIndex?: number;
+    call_id: string;
+    name: string;
+    arguments: string;
+    hadArgumentsDelta: boolean;
+  }
+
+  const pendingByItemId = new Map<string, PendingFunctionCall>();
+  const pendingByOutputIndex = new Map<number, PendingFunctionCall>();
+
+  const rememberPending = (call: PendingFunctionCall): void => {
+    if (call.itemId) {
+      pendingByItemId.set(call.itemId, call);
+    }
+    if (call.outputIndex !== undefined) {
+      pendingByOutputIndex.set(call.outputIndex, call);
+    }
+  };
+
+  const forgetPending = (call: PendingFunctionCall): void => {
+    if (call.itemId) {
+      pendingByItemId.delete(call.itemId);
+    }
+    if (call.outputIndex !== undefined) {
+      pendingByOutputIndex.delete(call.outputIndex);
+    }
+  };
+
+  const findPending = (parsed: Record<string, unknown>): PendingFunctionCall | null => {
+    const itemId = typeof parsed.item_id === "string" ? parsed.item_id : undefined;
+    if (itemId && pendingByItemId.has(itemId)) {
+      return pendingByItemId.get(itemId) ?? null;
+    }
+
+    const outputIndex =
+      typeof parsed.output_index === "number" ? parsed.output_index : undefined;
+    if (
+      outputIndex !== undefined &&
+      pendingByOutputIndex.has(outputIndex)
+    ) {
+      return pendingByOutputIndex.get(outputIndex) ?? null;
+    }
+
+    if (pendingByItemId.size === 1) {
+      return pendingByItemId.values().next().value ?? null;
+    }
+
+    if (pendingByOutputIndex.size === 1) {
+      return pendingByOutputIndex.values().next().value ?? null;
+    }
+
+    return null;
+  };
+
+  const flushText = (): void => {
+    if (!currentText) {
+      return;
+    }
+
+    fallbackOutput.push({
+      type: "message",
+      content: [{ type: "output_text", text: currentText }],
+    });
+    currentText = "";
+  };
+
+  const flushThinking = (): void => {
+    if (!currentThinking) {
+      return;
+    }
+
+    fallbackOutput.push({
+      type: "reasoning",
+      summary: [{ text: currentThinking }],
+    });
+    currentThinking = "";
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -483,22 +690,99 @@ export async function collectCodexResponseFromSSE(
           break;
 
         case "response.output_text.done": {
-          const text =
-            typeof parsed.text === "string" ? parsed.text : currentText;
-          if (text) {
-            fallbackOutput.push({
-              type: "message",
-              content: [{ type: "output_text", text }],
+          if (!currentText && typeof parsed.text === "string") {
+            currentText = parsed.text;
+          }
+          flushText();
+          break;
+        }
+
+        case "response.reasoning_summary_text.delta":
+        case "response.reasoning_text.delta":
+          if (typeof parsed.delta === "string") {
+            currentThinking += parsed.delta;
+          }
+          break;
+
+        case "response.reasoning_summary_part.done":
+          flushThinking();
+          break;
+
+        case "response.output_item.added": {
+          const item = isRecord(parsed.item) ? parsed.item : parsed;
+          if (item.type === "function_call") {
+            rememberPending({
+              itemId: typeof item.id === "string" ? item.id : undefined,
+              outputIndex:
+                typeof parsed.output_index === "number"
+                  ? parsed.output_index
+                  : undefined,
+              call_id:
+                (item.call_id as string) ||
+                (item.id as string) ||
+                "",
+              name: (item.name as string) || "unknown",
+              arguments:
+                typeof item.arguments === "string" ? item.arguments : "",
+              hadArgumentsDelta: false,
             });
           }
-          currentText = "";
+          break;
+        }
+
+        case "response.function_call_arguments.delta": {
+          const pending = findPending(parsed);
+          if (pending && typeof parsed.delta === "string") {
+            pending.arguments += parsed.delta;
+            pending.hadArgumentsDelta = true;
+          }
+          break;
+        }
+
+        case "response.function_call_arguments.done": {
+          const pending = findPending(parsed);
+          if (
+            pending &&
+            typeof parsed.arguments === "string"
+          ) {
+            pending.arguments = parsed.arguments;
+          }
           break;
         }
 
         case "response.output_item.done": {
+          flushThinking();
+          flushText();
           const item = isRecord(parsed.item) ? parsed.item : parsed;
           if (item.type === "function_call") {
-            fallbackOutput.push(item);
+            const pending =
+              findPending(parsed) ??
+              ({
+                call_id:
+                  (item.call_id as string) ||
+                  (item.id as string) ||
+                  "",
+                name: (item.name as string) || "unknown",
+                arguments:
+                  typeof item.arguments === "string"
+                    ? item.arguments
+                    : "",
+                hadArgumentsDelta: false,
+              } as PendingFunctionCall);
+            if (
+              !pending.hadArgumentsDelta &&
+              typeof item.arguments === "string" &&
+              item.arguments
+            ) {
+              pending.arguments = item.arguments;
+            }
+            fallbackOutput.push({
+              type: "function_call",
+              call_id: pending.call_id,
+              name: pending.name,
+              arguments: pending.arguments,
+            });
+            forgetPending(pending);
           }
           break;
         }
@@ -554,12 +838,8 @@ export async function collectCodexResponseFromSSE(
     return finalResponse;
   }
 
-  if (currentText) {
-    fallbackOutput.push({
-      type: "message",
-      content: [{ type: "output_text", text: currentText }],
-    });
-  }
+  flushThinking();
+  flushText();
 
   return {
     output:
@@ -581,7 +861,7 @@ export function startServer(port: number): http.Server {
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader(
       "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, x-api-key, anthropic-version"
+      "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta"
     );
 
     if (req.method === "OPTIONS") {
@@ -596,6 +876,15 @@ export function startServer(port: number): http.Server {
     if (url.pathname === "/health" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    // Main proxy route
+    if (
+      url.pathname === "/v1/messages/count_tokens" &&
+      req.method === "POST"
+    ) {
+      await handleCountTokens(req, res);
       return;
     }
 
@@ -712,6 +1001,7 @@ export function startServer(port: number): http.Server {
     logger.info(
       `Claudex proxy server listening on http://localhost:${port}`
     );
+    logger.info("Route: POST /v1/messages/count_tokens");
     logger.info("Route: POST /v1/messages (Anthropic Messages API)");
     logger.info("Route: GET  /claudex/models");
     logger.info("Route: POST /claudex/models/refresh");
