@@ -2,6 +2,9 @@
  * Dynamic model discovery — fetch available Codex models and map Anthropic tiers.
  */
 
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as logger from "./logger.js";
 
 // ---------- Types ----------
@@ -27,13 +30,19 @@ export interface TierMapping {
   haiku: string;
 }
 
+export interface StartupMappingLine {
+  matcher: string;
+  target: string;
+  example?: string;
+}
+
 // ---------- State ----------
 
 let cachedModels: Record<string, ModelEntry> = {};
 let cachedTierMapping: TierMapping = {
-  opus: "gpt-5.1-codex-max",
-  sonnet: "gpt-5.3-codex",
-  haiku: "gpt-5.1-codex-mini",
+  opus: "gpt-5.4",
+  sonnet: "gpt-5.4-mini",
+  haiku: "gpt-5.4-nano",
 };
 let lastFetchTime = 0;
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -41,12 +50,22 @@ let refreshTimer: ReturnType<typeof setInterval> | null = null;
 const FALLBACK_MODELS: Record<string, ModelEntry> = {
   "gpt-5.4": {
     name: "GPT-5.4",
-    description: "Latest GPT-5.4 model",
+    description: "Frontier model for complex professional and coding work",
     tier: "high",
+  },
+  "gpt-5.4-mini": {
+    name: "GPT-5.4 mini",
+    description: "Strongest GPT-5.4 mini model for coding and subagents",
+    tier: "mid",
+  },
+  "gpt-5.4-nano": {
+    name: "GPT-5.4 nano",
+    description: "Fast, cost-efficient GPT-5.4 model for simple tasks",
+    tier: "fast",
   },
   "gpt-5.3-codex": {
     name: "GPT-5.3 Codex",
-    description: "Default balanced model for coding tasks",
+    description: "Most capable Codex-specialized coding model",
     tier: "mid",
   },
   "gpt-5.2-codex": {
@@ -77,53 +96,139 @@ const FALLBACK_MODELS: Record<string, ModelEntry> = {
 };
 
 const FALLBACK_TIER_MAPPING: TierMapping = {
-  opus: "gpt-5.1-codex-max",
-  sonnet: "gpt-5.3-codex",
-  haiku: "gpt-5.1-codex-mini",
+  opus: "gpt-5.4",
+  sonnet: "gpt-5.4-mini",
+  haiku: "gpt-5.4-nano",
 };
 
-const DEFAULT_CODEX_MODEL = "gpt-5.3-codex";
+const DEFAULT_CODEX_MODEL = "gpt-5.4-mini";
+const DEFAULT_CODEX_CLIENT_VERSION = "0.115.0";
+const TIER_PREFERENCE_ORDER: Record<keyof TierMapping, string[]> = {
+  opus: [
+    "gpt-5.4",
+    "gpt-5.4-pro",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.1-codex-max",
+  ],
+  sonnet: [
+    "gpt-5.4-mini",
+    "gpt-5.3-codex",
+    "gpt-5.2-codex",
+    "gpt-5.2",
+    "gpt-5.1-codex",
+    "gpt-5-mini",
+  ],
+  haiku: [
+    "gpt-5.4-nano",
+    "gpt-5-mini",
+    "gpt-5.1-codex-mini",
+    "gpt-5.4-mini",
+  ],
+};
 
 // ---------- Tier Classification ----------
 
 function classifyTier(slug: string): "high" | "mid" | "fast" {
+  if (/^gpt-5\.4(?:$|-pro\b)/i.test(slug)) return "high";
+  if (/^gpt-5\.4-mini\b/i.test(slug)) return "mid";
+  if (/-(nano|fast|lite)\b/i.test(slug)) return "fast";
   if (/-(max|pro)\b/i.test(slug)) return "high";
-  if (/-(mini|fast|lite)\b/i.test(slug)) return "fast";
+  if (/-mini\b/i.test(slug)) return "fast";
   return "mid";
+}
+
+function pickPreferredModel(
+  slugs: string[],
+  preferred: string[],
+  excluded = new Set<string>()
+): string | null {
+  for (const slug of preferred) {
+    if (slugs.includes(slug) && !excluded.has(slug)) {
+      return slug;
+    }
+  }
+  return null;
+}
+
+function pickFirstByTier(
+  models: Record<string, ModelEntry>,
+  tier: ModelEntry["tier"],
+  excluded = new Set<string>()
+): string | null {
+  for (const [slug, entry] of Object.entries(models)) {
+    if (entry.tier === tier && !excluded.has(slug)) {
+      return slug;
+    }
+  }
+  return null;
 }
 
 function deriveTierMapping(models: Record<string, ModelEntry>): TierMapping {
   const slugs = Object.keys(models);
   if (slugs.length === 0) return { ...FALLBACK_TIER_MAPPING };
 
-  const highModels = slugs.filter((s) => models[s].tier === "high");
-  const midModels = slugs.filter((s) => models[s].tier === "mid");
-  const fastModels = slugs.filter((s) => models[s].tier === "fast");
-
   const opus =
-    highModels.find((s) => /-(max|pro)\b/i.test(s)) ||
-    highModels[0] ||
+    pickPreferredModel(slugs, TIER_PREFERENCE_ORDER.opus) ||
+    pickFirstByTier(models, "high") ||
     slugs[0];
-  const haiku =
-    fastModels.find((s) => /-(mini|fast|lite)\b/i.test(s)) ||
-    fastModels[0] ||
-    slugs[slugs.length - 1];
+  const used = new Set<string>([opus]);
   const sonnet =
-    midModels[0] || slugs.find((s) => s !== opus && s !== haiku) || slugs[0];
+    pickPreferredModel(slugs, TIER_PREFERENCE_ORDER.sonnet, used) ||
+    pickFirstByTier(models, "mid", used) ||
+    slugs.find((s) => !used.has(s)) ||
+    opus;
+  used.add(sonnet);
+  const haiku =
+    pickPreferredModel(slugs, TIER_PREFERENCE_ORDER.haiku, used) ||
+    pickFirstByTier(models, "fast", used) ||
+    slugs.find((s) => !used.has(s)) ||
+    sonnet;
 
   return { opus, sonnet, haiku };
 }
 
 // ---------- Fetching ----------
 
+function readClientVersionHint(): string | null {
+  const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+  try {
+    const raw = fs.readFileSync(cachePath, "utf8");
+    const parsed = JSON.parse(raw) as { client_version?: unknown };
+    return typeof parsed.client_version === "string"
+      ? parsed.client_version
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getCodexClientVersion(): string {
+  return (
+    process.env.CODEX_CLIENT_VERSION ||
+    readClientVersionHint() ||
+    DEFAULT_CODEX_CLIENT_VERSION
+  );
+}
+
+export function getModelsUrl(baseEndpoint?: string): string {
+  const base =
+    baseEndpoint ||
+    process.env.CODEX_API_ENDPOINT ||
+    "https://chatgpt.com/backend-api/codex/responses";
+  const modelsUrl = base.replace(/\/responses\/?$/, "/models");
+  const url = new URL(modelsUrl);
+  if (!url.searchParams.has("client_version")) {
+    url.searchParams.set("client_version", getCodexClientVersion());
+  }
+  return url.toString();
+}
+
 export async function fetchModelsFromAPI(
   accessToken: string,
   accountId?: string
 ): Promise<Record<string, ModelEntry> | null> {
-  const baseEndpoint =
-    process.env.CODEX_API_ENDPOINT ||
-    "https://chatgpt.com/backend-api/codex/responses";
-  const modelsUrl = baseEndpoint.replace(/\/responses\/?$/, "/models");
+  const modelsUrl = getModelsUrl();
 
   const headers: Record<string, string> = {
     Authorization: `Bearer ${accessToken}`,
@@ -252,6 +357,24 @@ export function getTierMapping(): TierMapping {
   return cachedTierMapping;
 }
 
+export function getStartupMappingLines(): StartupMappingLine[] {
+  return [
+    {
+      matcher: 'contains "opus"',
+      target: cachedTierMapping.opus,
+    },
+    {
+      matcher: 'contains "sonnet"',
+      target: cachedTierMapping.sonnet,
+      example: `sonnet4.6 -> ${cachedTierMapping.sonnet}`,
+    },
+    {
+      matcher: 'contains "haiku"',
+      target: cachedTierMapping.haiku,
+    },
+  ];
+}
+
 export function getLastFetchTime(): number {
   return lastFetchTime;
 }
@@ -272,6 +395,13 @@ export function mapModelByTier(anthropicModel: string): string | null {
 export function _resetForTesting(): void {
   cachedModels = { ...FALLBACK_MODELS };
   cachedTierMapping = { ...FALLBACK_TIER_MAPPING };
+  lastFetchTime = 0;
+  stopPeriodicRefresh();
+}
+
+export function _setModelsForTesting(models: Record<string, ModelEntry>): void {
+  cachedModels = { ...models };
+  cachedTierMapping = deriveTierMapping(cachedModels);
   lastFetchTime = 0;
   stopPeriodicRefresh();
 }

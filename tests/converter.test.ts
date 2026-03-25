@@ -34,7 +34,7 @@ describe("anthropicToCodex", () => {
 
     const result = anthropicToCodex(req);
 
-    assert.equal(result.model, "gpt-5.3-codex");
+    assert.equal(result.model, "gpt-5.4-mini");
     // max_output_tokens must NOT be sent (causes 400 from Codex API)
     assert.equal(
       (result as unknown as Record<string, unknown>).max_output_tokens,
@@ -96,6 +96,73 @@ describe("anthropicToCodex", () => {
     assert.equal(second.role, "assistant");
     assert.equal(second.content, "Hi there!");
     assert.equal(third.content, "How are you?");
+  });
+
+  it("should preserve user image URLs as input_image parts", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this screenshot." },
+            {
+              type: "image",
+              source: {
+                type: "url",
+                url: "https://example.com/screenshot.png",
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const message = asCodexMessage(result.input[0]);
+
+    assert.deepEqual(message.content, [
+      { type: "input_text", text: "Describe this screenshot." },
+      {
+        type: "input_image",
+        image_url: "https://example.com/screenshot.png",
+      },
+    ]);
+  });
+
+  it("should convert base64 user images into data URLs", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "What is in this image?" },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/jpeg",
+                data: "/9j/4AAQSkZJRgABAQAAAQABAAD",
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const message = asCodexMessage(result.input[0]);
+
+    assert.deepEqual(message.content, [
+      { type: "input_text", text: "What is in this image?" },
+      {
+        type: "input_image",
+        image_url: "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD",
+      },
+    ]);
   });
 
   it("should convert tools to OpenAI format with strict schema", () => {
@@ -1465,6 +1532,186 @@ describe("anthropicToCodex tool schema sanitization (integration)", () => {
     assert.equal(nestedProps.preview.format, undefined);
     assert.deepEqual(nested.required, ["preview", "label"]);
   });
+
+  it("should normalize Agent tools used for subagents", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "delegate this task" }],
+      tools: [
+        {
+          name: "Agent",
+          description: "Spawn a subagent",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.Agent),
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const params = result.tools![0].parameters as Record<string, unknown>;
+    const props = params.properties as Record<string, Record<string, unknown>>;
+
+    assert.equal(result.tools![0].name, "Agent");
+    assert.deepEqual(props.model.enum, ["sonnet", "opus", "haiku"]);
+    assert.equal(props.run_in_background.type, "boolean");
+    assert.equal(props.subagent_type.type, "string");
+    assertSchemaInvariants(params);
+  });
+
+  it("should normalize Bash, Read, Edit, and TodoWrite built-ins", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "do work" }],
+      tools: [
+        {
+          name: "Bash",
+          description: "Run a shell command",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.Bash),
+        },
+        {
+          name: "Read",
+          description: "Read a file",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.Read),
+        },
+        {
+          name: "Edit",
+          description: "Edit a file",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.Edit),
+        },
+        {
+          name: "TodoWrite",
+          description: "Update todos",
+          input_schema: structuredClone(REAL_TOOL_SCHEMA_FIXTURES.TodoWrite),
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const names = result.tools!.map((tool) => tool.name);
+    assert.deepEqual(names, ["Bash", "Read", "Edit", "TodoWrite"]);
+
+    for (const tool of result.tools!) {
+      assert.equal(tool.strict, true);
+      assert.equal(tool.parameters.additionalProperties, false);
+      assertSchemaInvariants(tool.parameters);
+    }
+
+    const bashParams = result.tools![0].parameters as Record<string, unknown>;
+    const bashNested = (
+      (bashParams.properties as Record<string, Record<string, unknown>>)
+        ._simulatedSedEdit.properties as Record<string, Record<string, unknown>>
+    );
+    assert.equal(bashNested.filePath.type, "string");
+    assert.equal(bashNested.newContent.type, "string");
+  });
+
+  it("should preserve MCP tool names and normalize MCP schemas", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "create an issue" }],
+      tools: [
+        {
+          name: "mcp__github__create_issue",
+          description: "Create a GitHub issue through MCP",
+          input_schema: {
+            type: "object",
+            properties: {
+              owner: { type: "string" },
+              repo: { type: "string" },
+              title: { type: "string" },
+              body: { type: "string" },
+              metadata: {
+                type: "object",
+                additionalProperties: {
+                  type: "string",
+                  format: "uri",
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const tool = result.tools![0];
+    const params = tool.parameters as Record<string, unknown>;
+    const metadata = (
+      params.properties as Record<string, Record<string, unknown>>
+    ).metadata;
+    const metadataValue = metadata.additionalProperties as Record<string, unknown>;
+
+    assert.equal(tool.name, "mcp__github__create_issue");
+    assert.equal(metadataValue.type, "string");
+    assert.equal(metadataValue.format, undefined);
+    assertSchemaInvariants(params);
+  });
+
+  it("should support Skill and MCP resource tools as regular function tools", () => {
+    const req: AnthropicRequest = {
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: 1024,
+      messages: [{ role: "user", content: "use skills and MCP resources" }],
+      tools: [
+        {
+          name: "Skill",
+          description: "Execute a skill",
+          input_schema: {
+            type: "object",
+            properties: {
+              skill_name: { type: "string" },
+              arguments: { type: "string" },
+            },
+          },
+        },
+        {
+          name: "ListMcpResourcesTool",
+          description: "List MCP resources",
+          input_schema: {
+            type: "object",
+            properties: {
+              server: { type: "string" },
+              cursor: { type: "string" },
+            },
+          },
+        },
+        {
+          name: "ReadMcpResourceTool",
+          description: "Read MCP resource",
+          input_schema: {
+            type: "object",
+            properties: {
+              server: { type: "string" },
+              uri: { type: "string", format: "uri" },
+            },
+          },
+        },
+      ],
+    };
+
+    const result = anthropicToCodex(req);
+    const names = result.tools!.map((tool) => tool.name);
+    assert.deepEqual(names, [
+      "Skill",
+      "ListMcpResourcesTool",
+      "ReadMcpResourceTool",
+    ]);
+
+    const readMcpParams = result.tools![2].parameters as Record<string, unknown>;
+    const uri = (
+      readMcpParams.properties as Record<string, Record<string, unknown>>
+    ).uri;
+    assert.equal(uri.type, "string");
+    assert.equal(uri.format, undefined);
+
+    for (const tool of result.tools!) {
+      assert.equal(tool.type, "function");
+      assert.equal(tool.strict, true);
+      assertSchemaInvariants(tool.parameters);
+    }
+  });
 });
 
 describe("codexToAnthropic", () => {
@@ -1805,7 +2052,7 @@ describe("mapModel", () => {
     const origEnv = process.env.CODEX_MODEL;
     delete process.env.CODEX_MODEL;
     try {
-      assert.equal(mapModel("claude-opus-4-20250514"), "gpt-5.1-codex-max");
+      assert.equal(mapModel("claude-opus-4-20250514"), "gpt-5.4");
     } finally {
       proxyConfig.model = saved;
       if (origEnv !== undefined) process.env.CODEX_MODEL = origEnv;
@@ -1820,7 +2067,7 @@ describe("mapModel", () => {
     try {
       assert.equal(
         mapModel("claude-3-5-sonnet-20241022"),
-        "gpt-5.3-codex"
+        "gpt-5.4-mini"
       );
     } finally {
       proxyConfig.model = saved;
@@ -1836,7 +2083,7 @@ describe("mapModel", () => {
     try {
       assert.equal(
         mapModel("claude-3-5-haiku-20241022"),
-        "gpt-5.1-codex-mini"
+        "gpt-5.4-nano"
       );
     } finally {
       proxyConfig.model = saved;
@@ -1853,10 +2100,10 @@ describe("CODEX_MODELS", () => {
   it("should contain expected models from fallback list", () => {
     _resetForTesting();
     const models = getModels();
-    assert.ok(models["gpt-5.3-codex"]);
-    assert.ok(models["gpt-5.1-codex-max"]);
-    assert.ok(models["gpt-5.1-codex-mini"]);
-    assert.equal(models["gpt-5.1-codex-max"].tier, "high");
-    assert.equal(models["gpt-5.1-codex-mini"].tier, "fast");
+    assert.ok(models["gpt-5.4"]);
+    assert.ok(models["gpt-5.4-mini"]);
+    assert.ok(models["gpt-5.4-nano"]);
+    assert.equal(models["gpt-5.4"].tier, "high");
+    assert.equal(models["gpt-5.4-nano"].tier, "fast");
   });
 });

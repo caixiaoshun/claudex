@@ -160,6 +160,15 @@ async function handleMessages(
     stream: true,
   };
 
+  logger.debug("Resolved model mapping", {
+    anthropicModel: anthropicReq.model,
+    codexModel: codexReq.model,
+    reasoning:
+      isRecord(codexReq.reasoning) && typeof codexReq.reasoning.effort === "string"
+        ? codexReq.reasoning.effort
+        : null,
+  });
+
   const schemaDebugTools = new Set([
     "AskUserQuestion",
     "ExitPlanMode",

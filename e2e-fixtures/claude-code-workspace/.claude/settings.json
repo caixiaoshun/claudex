@@ -1,0 +1,16 @@
+{
+  "enabledPlugins": {
+    "feature-dev@claude-plugins-official": true
+  },
+  "PreToolUse": [
+    {
+      "matcher": "Write|Edit|MultiEdit|Read",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "cmd /c \"echo HOOK-E2E-ACTIVE>>.claude\\e2e-hook-log.txt && echo {\\\"systemMessage\\\":\\\"HOOK-E2E-ACTIVE\\\"}\""
+        }
+      ]
+    }
+  ]
+}

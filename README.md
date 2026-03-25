@@ -45,6 +45,17 @@ npm run build
 
 ---
 
+## Recent Updates
+
+- Startup logs now print the live Claude-to-GPT tier mapping directly, including an explicit `sonnet4.6 -> ...` line so it is obvious which GPT model Claude Code is really using.
+- The default `opus` / `sonnet` / `haiku` mapping has been refreshed to the current GPT-5.4 family: `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.4-nano`.
+- Dynamic model discovery is more reliable now: Claudex sends the Codex `client_version` hint when fetching `/codex/models`, and live discovery prefers GPT-5.4 family models before older Codex fallbacks.
+- Claude Code image inputs now work end to end. Anthropic image blocks are converted into Responses API `input_image` items for both remote URLs and base64 screenshots.
+- A real Windows Claude Code compatibility harness was added for live verification of print/json/stream mode, custom model overrides, `CLAUDE.md` memory, skills, slash commands, plugins, custom agents and subagents, todo/file workflows, hook triggering, MCP config/tools/resources/prompts, and session `resume` / `continue`.
+- Documentation was updated to reflect the refreshed mappings, the new startup visibility, the live compatibility audit, and the wider official Claude Code feature surface around automation and session handoff.
+
+---
+
 ## Quick Start
 
 ### Step 1: Bypass Claude Code Onboarding
@@ -180,24 +191,26 @@ Successful validation means the entire session completes with streamed output vi
 
 ### Automatic Tier Mapping
 
-Claudex automatically maps Anthropic model names to the best available Codex model:
+Claudex automatically maps Anthropic model names to the best available OpenAI model:
 
 | Claude Code sends | Claudex uses |
 |-------------------|--------------|
-| `claude-opus-*` | Highest capability (e.g. `gpt-5.1-codex-max`) |
-| `claude-*-sonnet-*` | Balanced/default (e.g. `gpt-5.3-codex`) |
-| `claude-*-haiku-*` | Fastest (e.g. `gpt-5.1-codex-mini`) |
+| `claude-opus-*` | Highest capability (currently `gpt-5.4`) |
+| `claude-*-sonnet-*` | Balanced/default (currently `gpt-5.4-mini`) |
+| `claude-*-haiku-*` | Fastest/lightest (currently `gpt-5.4-nano`) |
+
+When live model discovery succeeds, Claudex prefers the current GPT-5.4 family first and then falls back to older Codex-specialized models only if those newer models are unavailable.
 
 ### Override at Startup
 
 ```bash
-claudex --model gpt-5.3-codex --reasoning high
+claudex --model gpt-5.4-mini --reasoning high
 ```
 
 ### Override via Environment Variables
 
 ```bash
-CODEX_MODEL=gpt-5.3-codex CODEX_REASONING=high claudex
+CODEX_MODEL=gpt-5.4-mini CODEX_REASONING=high claudex
 ```
 
 ### Override at Runtime
@@ -205,7 +218,7 @@ CODEX_MODEL=gpt-5.3-codex CODEX_REASONING=high claudex
 ```bash
 curl -X POST http://localhost:4000/claudex/config \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5.3-codex", "reasoning": "high"}'
+  -d '{"model": "gpt-5.4-mini", "reasoning": "high"}'
 ```
 
 ### Via Claude Code's `/model` Command
@@ -213,13 +226,13 @@ curl -X POST http://localhost:4000/claudex/config \
 Use the `claudex:<model>:<reasoning>` convention:
 
 ```
-/model claudex:gpt-5.3-codex:high
+/model claudex:gpt-5.4-mini:high
 ```
 
 The reasoning parameter is optional:
 
 ```
-/model claudex:gpt-5.1-codex-max
+/model claudex:gpt-5.4
 ```
 
 ### Reasoning Intensity Levels
@@ -293,7 +306,7 @@ curl -X POST http://localhost:4000/claudex/models/refresh
 # Update config
 curl -X POST http://localhost:4000/claudex/config \
   -H "Content-Type: application/json" \
-  -d '{"model": "gpt-5.3-codex", "reasoning": "medium"}'
+  -d '{"model": "gpt-5.4-mini", "reasoning": "medium"}'
 
 # Send a message (Anthropic format)
 curl -X POST http://localhost:4000/v1/messages \
@@ -316,7 +329,7 @@ Usage:
 
 Options:
   -p, --port <port>              Port to listen on (default: 4000)
-  --model <model>                Codex model to use (e.g. gpt-5.3-codex)
+  --model <model>                OpenAI model to use (e.g. gpt-5.4-mini)
   --reasoning <low|medium|high>  Reasoning intensity level
   --reuse-codex                  Import credentials from existing Codex/opencode install
   --list-sources                 List detected external credential sources and exit
@@ -332,7 +345,7 @@ Options:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CODEX_MODEL` | Codex model to use | Auto-mapped from Claude Code model |
+| `CODEX_MODEL` | OpenAI model to use | Auto-mapped from Claude Code model |
 | `CODEX_REASONING` | Reasoning intensity (`low`, `medium`, `high`) | Auto |
 | `CODEX_API_ENDPOINT` | Override Codex API endpoint | `https://chatgpt.com/backend-api/codex/responses` |
 | `CODEX_MODEL_REFRESH_INTERVAL` | Model refresh interval in ms | `3600000` (1 hour) |

@@ -16,6 +16,7 @@ import {
   refreshModels,
   startPeriodicRefresh,
   getModels,
+  getStartupMappingLines,
 } from "./models.js";
 
 const DEFAULT_PORT = 4000;
@@ -159,12 +160,21 @@ async function main(): Promise<void> {
   const modelDisplay =
     proxyConfig.model || "(auto-mapped from Claude Code model)";
   const reasoningDisplay = proxyConfig.reasoning || "(auto)";
+  const mappingDisplay = getStartupMappingLines()
+    .map((line) =>
+      line.example
+        ? `  ${line.matcher} -> ${line.target} (${line.example})`
+        : `  ${line.matcher} -> ${line.target}`
+    )
+    .join("\n");
 
   console.log(`
 \x1b[32m✅ Proxy is ready!\x1b[0m
 
 \x1b[33mModel:\x1b[0m      ${modelDisplay}
 \x1b[33mReasoning:\x1b[0m  ${reasoningDisplay}
+\x1b[33mAuto Mapping:\x1b[0m
+${mappingDisplay}
 
 \x1b[33mConfigure Claude Code:\x1b[0m
   export ANTHROPIC_BASE_URL=http://localhost:${port}
@@ -249,7 +259,7 @@ Usage:
 
 Options:
   -p, --port <port>           Port to listen on (default: 4000)
-  --model <model>             Codex model to use (e.g. gpt-5.3-codex)
+  --model <model>             OpenAI model to use (e.g. gpt-5.4-mini)
   --reasoning <low|medium|high>  Reasoning intensity level
   --reuse-codex               Import credentials from an existing Codex / opencode
                               installation instead of launching the browser OAuth flow.
@@ -264,20 +274,20 @@ Options:
   -v, --version               Show version
 
 Environment Variables:
-  CODEX_MODEL                  Codex model to use (default: auto-mapped from Claude Code model)
+  CODEX_MODEL                  OpenAI model to use (default: auto-mapped from Claude Code model)
   CODEX_REASONING              Reasoning intensity: low, medium, or high
   CODEX_API_ENDPOINT           Override Codex API endpoint
   CODEX_MODEL_REFRESH_INTERVAL Model refresh interval in ms (default: 3600000 = 1 hour)
   PROXY_PORT                   Default port (overridden by --port)
 
 Model Selection:
-  At startup:        claudex --model gpt-5.3-codex --reasoning high
-  Via env:           CODEX_MODEL=gpt-5.3-codex CODEX_REASONING=high claudex
+  At startup:        claudex --model gpt-5.4-mini --reasoning high
+  Via env:           CODEX_MODEL=gpt-5.4-mini CODEX_REASONING=high claudex
   At runtime:        curl -X POST http://localhost:4000/claudex/config \\
-                       -d '{"model":"gpt-5.3-codex","reasoning":"high"}'
+                       -d '{"model":"gpt-5.4-mini","reasoning":"high"}'
   Via /model in Claude Code:
-                     Use the model name claudex:<codex-model>:<reasoning>
-                     e.g. claudex:gpt-5.3-codex:high
+                     Use the model name claudex:<model>:<reasoning>
+                     e.g. claudex:gpt-5.4-mini:high
 
 Model Discovery:
   On startup, Claudex fetches the live model list from the Codex API
@@ -304,7 +314,7 @@ Examples:
   claudex --reuse-codex
 
   # Use specific model and reasoning level
-  claudex --model gpt-5.1-codex-max --reasoning high
+  claudex --model gpt-5.4 --reasoning high
 
   # See what credential files were detected on this machine
   claudex --list-sources

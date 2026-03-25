@@ -147,9 +147,23 @@ export interface CodexReasoning {
   summary?: "auto" | "concise" | "detailed";
 }
 
+export interface CodexInputTextPart {
+  type: "input_text";
+  text: string;
+}
+
+export interface CodexInputImagePart {
+  type: "input_image";
+  image_url: string;
+}
+
+export type CodexMessageContent =
+  | string
+  | Array<CodexInputTextPart | CodexInputImagePart>;
+
 export interface CodexInputMessage {
   role: string;
-  content: unknown;
+  content: CodexMessageContent;
 }
 
 export interface CodexFunctionCallInput {
@@ -590,6 +604,7 @@ function convertMessages(
     // Array content blocks
     const blocks = msg.content;
     const textParts: string[] = [];
+    const imageParts: CodexInputImagePart[] = [];
     const functionCalls: CodexFunctionCallInput[] = [];
     const functionOutputs: CodexFunctionCallOutputInput[] = [];
 
@@ -635,12 +650,15 @@ function convertMessages(
           break;
         }
 
-        case "image":
-          // Pass image URLs when possible, skip base64 (Codex doesn't support inline base64)
-          if (block.source.url) {
+        case "image": {
+          const imagePart = convertImageBlock(block);
+          if (msg.role === "user" && imagePart) {
+            imageParts.push(imagePart);
+          } else if (block.source.url) {
             textParts.push(`[Image: ${block.source.url}]`);
           }
           break;
+        }
       }
     }
 
@@ -664,22 +682,62 @@ function convertMessages(
         for (const fo of functionOutputs) {
           result.push(fo);
         }
-        if (textParts.length > 0) {
+        if (textParts.length > 0 || imageParts.length > 0) {
           result.push({
             role: "user",
-            content: textParts.join("\n"),
+            content: buildUserMessageContent(textParts, imageParts),
           });
         }
       } else {
         result.push({
           role: "user",
-          content: textParts.length > 0 ? textParts.join("\n") : "",
+          content: buildUserMessageContent(textParts, imageParts),
         });
       }
     }
   }
 
   return result;
+}
+
+function convertImageBlock(
+  block: AnthropicImageContent
+): CodexInputImagePart | null {
+  if (block.source.type === "url" && block.source.url) {
+    return {
+      type: "input_image",
+      image_url: block.source.url,
+    };
+  }
+
+  if (block.source.type === "base64" && block.source.data) {
+    return {
+      type: "input_image",
+      image_url: `data:${block.source.media_type || "image/png"};base64,${block.source.data}`,
+    };
+  }
+
+  return null;
+}
+
+function buildUserMessageContent(
+  textParts: string[],
+  imageParts: CodexInputImagePart[]
+): CodexMessageContent {
+  if (imageParts.length === 0) {
+    return textParts.length > 0 ? textParts.join("\n") : "";
+  }
+
+  const content: Array<CodexInputTextPart | CodexInputImagePart> = [];
+  const text = textParts.join("\n");
+  if (text) {
+    content.push({
+      type: "input_text",
+      text,
+    });
+  }
+  content.push(...imageParts);
+  return content;
 }
 
 /** Extract system prompt/instructions from Anthropic request. */

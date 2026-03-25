@@ -11,7 +11,8 @@
     "start": "node dist/src/index.js",
     "dev": "tsc --watch",
     "test": "npm run build && node --test dist/tests/*.test.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test:live:e2e": "powershell -ExecutionPolicy Bypass -File scripts/run-live-e2e.ps1"
   },
   "keywords": [
     "claude",
@@ -32,7 +33,9 @@
     "dist"
   ],
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@types/node": "^25.5.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "zod": "^4.1.12"
   }
 }
